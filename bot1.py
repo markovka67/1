@@ -30,6 +30,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import logging
+import hashlib
+from logging.handlers import RotatingFileHandler
+
 import vk_api
 from vk_api.bot_longpoll import VkBotEventType, VkBotLongPoll
 
@@ -60,17 +64,43 @@ CONTROL_PIPE_PATH = "/tmp/vk_bot_control.pipe"
 MSK_TZ = timezone(timedelta(hours=3), name="MSK")
 TG_SENIOR_ADMIN_USERNAME = os.getenv("TG_SENIOR_ADMIN_USERNAME", "senior_admin").strip().lstrip("@").lower()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _make_logger() -> logging.Logger:
+    log = logging.getLogger("bot")
+    if log.handlers:
+        return log
+    log.setLevel(logging.DEBUG)
+    # Файл с ротацией: 10 MB × 5 файлов
+    fh = RotatingFileHandler(
+        os.path.join(BASE_DIR, "bot.log"),
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)-8s] %(message)s", "%Y-%m-%d %H:%M:%S"
+    ))
+    # Консоль — только WARNING+
+    ch = logging.StreamHandler(sys.stderr)
+    ch.setLevel(logging.WARNING)
+    ch.setFormatter(logging.Formatter("[BOT] %(levelname)s: %(message)s"))
+    log.addHandler(fh)
+    log.addHandler(ch)
+    return log
+
+logger = _make_logger()
 DEFAULT_DB_PATH = os.path.join(BASE_DIR, "bot.db")
 ISTORIA_DB_PATH = os.path.join(BASE_DIR, "istoria.db")
-ENCRYPTION_KEY_A = os.getenv("ENCRYPTION_KEY_A", "key_a_default")
-ENCRYPTION_KEY_B = os.getenv("ENCRYPTION_KEY_B", "key_b_default")
+LISTS_DB_PATH = os.path.join(BASE_DIR, "lists.db")
+# ENCRYPTION_KEY_A/B are set below with validation
 
 TG_PEER_SHIFT = 10_000_000_000_000
 PRIVACY_POLICY_URL = os.getenv("PRIVACY_POLICY_URL", "https://vk.ru/@pulse_rwpe-politika-konfedencialnosti").strip()
 
 # ---------------------------- Быстрые настройки версии ----------------------------
 # Для тестового стенда достаточно поменять эти 2 строки:
-BOT_VERSION = "04,05,2026 15:30 (МСК)"
+BOT_VERSION = "02.06.2026 8:31(МСК)"
 BOT_DB_PATH_CONFIG = os.path.join(BASE_DIR, "bot.db")
 # Backward-compat alias for legacy typo in some deployments/scripts.
 BOT_DB_PATH_CONIG = BOT_DB_PATH_CONFIG
@@ -82,8 +112,17 @@ load_dotenv()
 # Все секреты берутся из переменных окружения
 HARDCODED_GROUP_TOKEN = os.getenv("VK_GROUP_TOKEN", "")
 HARDCODED_GROUP_ID = int(os.getenv("VK_GROUP_ID", "0"))
-ENCRYPTION_KEY_A = os.getenv("BOT_KEY_A", "")
-ENCRYPTION_KEY_B = os.getenv("BOT_KEY_B", "")
+_key_a = os.getenv("BOT_KEY_A", "").strip()
+_key_b = os.getenv("BOT_KEY_B", "").strip()
+if not _key_a or not _key_b:
+    sys.exit(
+        "FATAL: BOT_KEY_A и BOT_KEY_B должны быть заданы в .env\n"
+        "Генерация: python3 -c \"import secrets; print(secrets.token_hex(32))\""
+    )
+if len(_key_a) < 16 or len(_key_b) < 16:
+    sys.exit("FATAL: BOT_KEY_A и BOT_KEY_B должны быть не менее 16 символов.")
+ENCRYPTION_KEY_A: str = _key_a
+ENCRYPTION_KEY_B: str = _key_b
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 WIPE_PASSWORD = os.getenv("WIPE_PASSWORD", "")
 SENIOR_ADMIN_ID_CONFIG = int(os.getenv("SENIOR_ADMIN_ID", "576521317"))
@@ -116,29 +155,27 @@ COMMAND_ACCESS: dict[str, dict[str, int]] = {
     "!снятьчс": {"user_default": 70, "admin_default": 10},
     "!списокчс": {"user_default": 0, "admin_default": 10},
     "!выговор": {"user_default": 0, "admin_default": 5},
-    "!снятьвыговор": {"user_default": 0, "admin_default": 5},
-    "!списоквыговоров": {"user_default": 0, "admin_default": 5},
     "!снять": {"user_default": 70, "admin_default": 0},
     "!чат": {"user_default": 70, "admin_default": 40},
     "!убрать": {"user_default": 70, "admin_default": 40},
     "!пуш": {"user_default": 70, "admin_default": 0},
+    "!пуш-": {"user_default": 0, "admin_default": 10},
+    "!пуш+": {"user_default": 0, "admin_default": 10},
     "!узнать": {"user_default": 0, "admin_default": 30},
-    "!обновить": {"user_default": 0, "admin_default": 30},
     "!супербан": {"user_default": 0, "admin_default": 30},
     "!чаты": {"user_default": 0, "admin_default": 30},
     "!все": {"user_default": 0, "admin_default": 80},
     "!блок": {"user_default": 0, "admin_default": 80},
     "!разблок": {"user_default": 0, "admin_default": 80},
     "!лидер": {"user_default": 0, "admin_default": 100},
+    "!лидеры": {"user_default": 0, "admin_default": 0},
+    "!уволиться": {"user_default": 0, "admin_default": 0},
     "!снятьлидера": {"user_default": 0, "admin_default": 100},
     "!админ": {"user_default": 0, "admin_default": 100},
     "!стереть": {"user_default": 0, "admin_default": 100},
-    "!добавить": {"user_default": 0, "admin_default": 100},
     "!ботбан": {"user_default": 0, "admin_default": 100},
     "!ботразбан": {"user_default": 0, "admin_default": 100},
     "!лимиткоманд": {"user_default": 0, "admin_default": 100},
-    "!передать": {"user_default": 0, "admin_default": 100},
-    "!админконсоль": {"user_default": 0, "admin_default": 100},
     "!логчат": {"user_default": 0, "admin_default": 100},
     "!логвкл": {"user_default": 0, "admin_default": 100},
     "!логвыкл": {"user_default": 0, "admin_default": 100},
@@ -158,6 +195,7 @@ COMMAND_ACCESS: dict[str, dict[str, int]] = {
     "!переименовать": {"user_default": 70, "admin_default": 10},
     "!новый": {"user_default": 0, "admin_default": 90},
     "!дж": {"user_default": 0, "admin_default": 0},
+    "!синхроль": {"user_default": 0, "admin_default": 70},
     "!банфракция": {"user_default": 70, "admin_default": 10},
     "!изменить": {"user_default": 0, "admin_default": 50},
     "!новая": {"user_default": 70, "admin_default": 0},
@@ -197,15 +235,44 @@ COMMAND_ACCESS: dict[str, dict[str, int]] = {
     "!снятьрольвезде": {"user_default": 0, "admin_default": 50},
     "!тишина": {"user_default": 0, "admin_default": 50},
     "!снятьтишину": {"user_default": 0, "admin_default": 50},
+    "!новый список": {"user_default": 0, "admin_default": 90},
+    "!список": {"user_default": 0, "admin_default": 0},
+    "!все списки": {"user_default": 0, "admin_default": 0},
+    "!удалить список": {"user_default": 0, "admin_default": 90},
     "!голос": {"user_default": 0, "admin_default": 50},
     "!допрассм": {"user_default": 0, "admin_default": 100},
-    "!списокдопрассм": {"user_default": 0, "admin_default": 100},
     "!допинфа": {"user_default": 0, "admin_default": 0},
     "!инфа": {"user_default": 0, "admin_default": 0},
     "!удалитьинфу": {"user_default": 0, "admin_default": 0},
     "!облик": {"user_default": 0, "admin_default": 100},
     "!проверкачата": {"user_default": 0, "admin_default": 80},
     "!удаленный": {"user_default": 0, "admin_default": 80},
+    "!тишина": {"user_default": 0, "admin_default": 50},
+    "!дж заголовок": {"user_default": 0, "admin_default": 70},
+    "!дж новая": {"user_default": 0, "admin_default": 70},
+    "!дж удалить": {"user_default": 0, "admin_default": 70},
+    "!дж переименовать": {"user_default": 0, "admin_default": 70},
+    "!снять выговор": {"user_default": 0, "admin_default": 5},
+    "!снять роль": {"user_default": 70, "admin_default": 0},
+    "!создать роль": {"user_default": 70, "admin_default": 0},
+    "!список чс": {"user_default": 0, "admin_default": 10},
+    "!список выговоров": {"user_default": 0, "admin_default": 5},
+    "!список допрассм": {"user_default": 0, "admin_default": 100},
+    "!право админ": {"user_default": 0, "admin_default": 100},
+    "!синхроль": {"user_default": 0, "admin_default": 70},
+    "!сотрудники": {"user_default": 0, "admin_default": 0},
+    "!разрешить": {"user_default": 0, "admin_default": 30},
+    "!запретить": {"user_default": 0, "admin_default": 30},
+    "!проверка команд": {"user_default": 0, "admin_default": 30},
+    "!приветствие": {"user_default": 0, "admin_default": 0},
+    "!новое приветствие": {"user_default": 0, "admin_default": 40},
+    "!удалить приветствие": {"user_default": 0, "admin_default": 40},
+    "!отключить чат": {"user_default": 0, "admin_default": 40},
+    "!включить чат": {"user_default": 0, "admin_default": 40},
+    "!список доступ": {"user_default": 0, "admin_default": 30},
+    "!списки": {"user_default": 0, "admin_default": 0},
+    "!приглос": {"user_default": 0, "admin_default": 40},
+    "!аудит": {"user_default": 0, "admin_default": 100},
 }
 
 DEFAULT_COMMAND_RIGHTS = {k: v["user_default"] for k, v in COMMAND_ACCESS.items()}
@@ -220,7 +287,127 @@ COMMAND_ALIASES: dict[str, list[str]] = {
     "!суперразбан": ["!суперазбан"],
     "!рейтинг": ["!рейтиг"],
     "!право": ["!прово"],
+    "!уволиться": ["!уволится"],
+    "!дж": ["!должности", "!дж_список", "!дж_лист"],
+    "!неприниматьдж": ["!непринматьдж", "!нпдж", "!неприниматьработу"],
+    "!нанять": ["!нанят", "!принять на работу"],
+    "!сотрудники": ["!сотрудники", "!состав"],
+    "!синхроль": ["!синхрол", "!синхронрол"],
+    "!разрешить": ["!разрешать", "!разрешит"],
+    "!запретить": ["!запрет", "!запретить"],
+    "!приветствие": ["!привет чат", "!привет"],
+    "!новое приветствие": ["!новоеприветствие", "!установить приветствие"],
+    "!удалить приветствие": ["!удалитьприветствие", "!убрать приветствие"],
+    "!отключить чат": ["!отключитьчат"],
+    "!включить чат": ["!включитьчат"],
+    "!списки": ["!списки"],
+    "!приглос": ["!приглашение", "!пригласить"],
+    "!все списки": ["!все списки", "!всесписки"],
+    "!список доступ": ["!списокдоступ"],
+    "!дж": ["!должности", "!дж_список", "!дж_лист", "!дж в роли"],
 }
+
+# ─── Нечёткое сопоставление команд ─────────────────────────────────────────
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Расстояние Левенштейна между двумя строками (Unicode-safe)."""
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    # Оптимизация: одна строка dp
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i] + [0] * lb
+        for j, cb in enumerate(b, 1):
+            curr[j] = min(
+                prev[j] + 1,      # удаление
+                curr[j - 1] + 1,  # вставка
+                prev[j - 1] + (0 if ca == cb else 1),  # замена
+            )
+        prev = curr
+    return prev[lb]
+
+
+def _fuzzy_resolve_command(raw_cmd: str) -> str:
+    """Пытается сопоставить ошибочно введённую команду с ближайшей известной.
+
+    Правила:
+    • Команда должна начинаться с '!'
+    • Расстояние Левенштейна <= max_dist (зависит от длины команды)
+    • Если несколько кандидатов на одном расстоянии — берём самый короткий
+      (предпочитаем более конкретное совпадение)
+    • Никогда не подбираем если неоднозначность (два разных кандидата с равным расстоянием)
+    """
+    if not raw_cmd.startswith("!"):
+        return raw_cmd
+
+    # Строим плоский список всех известных команд
+    known: list[str] = list(COMMAND_ACCESS.keys())
+    # Добавляем алиасы как допустимые цели
+    for canonical, aliases in COMMAND_ALIASES.items():
+        for al in aliases:
+            if al not in known:
+                known.append(al)
+
+    cmd_len = len(raw_cmd)
+
+    # Порог: короткие команды (<=5 символов с "!") — только 1 ошибка
+    # средние (6..9) — до 2 ошибок; длинные (10+) — до 3 ошибок
+    if cmd_len <= 5:
+        max_dist = 1
+    elif cmd_len <= 9:
+        max_dist = 2
+    else:
+        max_dist = 3
+
+    best_dist = max_dist + 1
+    best_candidates: list[str] = []
+
+    for known_cmd in known:
+        # Быстрая проверка: разница длин уже больше порога → пропускаем
+        if abs(len(known_cmd) - cmd_len) > max_dist:
+            continue
+        dist = _levenshtein(raw_cmd, known_cmd)
+        if dist < best_dist:
+            best_dist = dist
+            best_candidates = [known_cmd]
+        elif dist == best_dist:
+            best_candidates.append(known_cmd)
+
+    if best_dist == 0:
+        # Точное совпадение (или алиас) — вернём canonical через _resolve_alias
+        return raw_cmd
+
+    if not best_candidates or best_dist > max_dist:
+        return raw_cmd  # Не нашли ничего подходящего
+
+    # Если один однозначный кандидат — возвращаем его canonical форму
+    if len(best_candidates) == 1:
+        canonical = best_candidates[0]
+        # Если это алиас — нормализуем до canonical
+        for can, aliases in COMMAND_ALIASES.items():
+            if canonical in aliases:
+                return can
+        return canonical
+
+    # Несколько кандидатов на одном расстоянии:
+    # Предпочитаем тот, у которого совпадает длина с введённой командой
+    same_len = [c for c in best_candidates if len(c) == cmd_len]
+    if len(same_len) == 1:
+        canonical = same_len[0]
+        for can, aliases in COMMAND_ALIASES.items():
+            if canonical in aliases:
+                return can
+        return canonical
+
+    # Неоднозначность — не угадываем
+    return raw_cmd
+
 
 COMMAND_USAGE: dict[str, str] = {
     "!я": "!я",
@@ -242,7 +429,9 @@ COMMAND_USAGE: dict[str, str] = {
     "!банан": "!банан (пользователь) (причина) или ответом на сообщение",
     "!списокпредов": "!списокпредов",
     "!чистка": "!чистка (количество|время)",
-    "!пуш": "!пуш (текст) / !пуш (фракция) (текст) / !пуш all (текст)",
+    "!пуш": "!пуш (ответ на сообщение) | для Админ: !пуш (фракция) (сервер) [@all]",
+    "!пуш-": "!пуш- — отключить пуши в этом чате",
+    "!пуш+": "!пуш+ — включить пуши в этом чате",
     "!роли": "!роли",
     "!удалить": "!удалить роль (уровень)",
     "!создать": "!создать роль (название) (уровень)",
@@ -264,7 +453,10 @@ COMMAND_USAGE: dict[str, str] = {
     "!поиск": "!поиск (никнейм)",
     "!скрыть": "!скрыть (пользователь)",
     "!раскрыть": "!раскрыть (пользователь)",
-    "!уволить": "!уволить (пользователь)",
+    "!уволить": "!уволить (пользователь) | !снять (пользователь)",
+    "!дж": "!дж | !дж новая (название) (уровень) | !дж удалить (уровень/название) | !дж заголовок (название) (мин-макс) | !дж заголовок удалить (название) | !дж переименовать (название) (новое) | !дж в роли",
+    "!сотрудники": "!сотрудники [фракция] [сервер]",
+    "!неприниматьдж": "!неприниматьдж — не получать предложения о найме",
     "!нанять": "!нанять (пользователь) (должность)",
     "!рейтинг": "!рейтинг (+N|-N) (пользователь) (причина)",
     "!админсчет": "!админсчет",
@@ -301,11 +493,23 @@ COMMAND_USAGE: dict[str, str] = {
     "!убрать": "!убрать чат фракции",
     "!чаты": "!чаты фракций (фракция) (сервер 1..3)",
     "!лидер": "!лидер (фракция) (сервер 1..3) (пользователь)",
+    "!лидеры": "!лидеры [фракция]",
+    "!уволиться": "!уволиться (причина)",
     "!стереть": "!стереть (пользователь)",
     "!все": "!все чаты",
     "!блок": "!блок чат (номер)",
     "!разблок": "!разблок чат (номер)",
     "!права": "!права [уровень роли]",
+    "!тишина": "!тишина [минуты] [сообщений]",
+    "!новый список": "!новый список (название) (уровень_адм_прав)",
+    "!список": "!список (название)",
+    "!все списки": "!все списки",
+    "!удалить список": "!удалить список (название)",
+    "!тишина_иммунитет": "!тишина иммунитет [+|-] [пользователь] [время]",
+    "!тишина_админпорог": "!тишина админпорог <уровень>",
+
+    "!приглос": "!приглос [уровень роли] — настроить минимальную роль для приглашения в чат",
+    "!аудит": "!аудит файлы — проверить хеши bot1.py, .env, bot.db",
 }
 
 COMMAND_REQUIRED_ARGS: dict[str, list[str]] = {
@@ -410,6 +614,25 @@ class DB:
                 CREATE TABLE IF NOT EXISTS chat_controls (
                     chat_id INTEGER PRIMARY KEY,
                     enabled INTEGER NOT NULL DEFAULT 1
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_invite_level (
+                    chat_id INTEGER PRIMARY KEY,
+                    min_role INTEGER NOT NULL DEFAULT 40,
+                    min_admin INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_push_disabled (
+                    chat_id INTEGER PRIMARY KEY
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_greetings (
+                    chat_id INTEGER PRIMARY KEY,
+                    text TEXT NOT NULL DEFAULT '',
+                    attachment TEXT NOT NULL DEFAULT '',
+                    sticker_id INTEGER,
+                    created_by INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS chat_roles (
@@ -642,6 +865,55 @@ class DB:
                     created_at INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS dj_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    faction TEXT NOT NULL,
+                    server_id INTEGER NOT NULL DEFAULT 1,
+                    level INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    UNIQUE(faction, server_id, level),
+                    UNIQUE(faction, server_id, name COLLATE NOCASE)
+                );
+
+                CREATE TABLE IF NOT EXISTS dj_headers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    faction TEXT NOT NULL,
+                    server_id INTEGER NOT NULL DEFAULT 1,
+                    title TEXT NOT NULL,
+                    level_min INTEGER NOT NULL,
+                    level_max INTEGER NOT NULL,
+                    UNIQUE(faction, server_id, title COLLATE NOCASE)
+                );
+
+                CREATE TABLE IF NOT EXISTS hire_offers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_user_id INTEGER NOT NULL,
+                    actor_user_id INTEGER NOT NULL,
+                    faction TEXT NOT NULL,
+                    server_id INTEGER NOT NULL DEFAULT 1,
+                    position_name TEXT NOT NULL,
+                    position_level INTEGER NOT NULL DEFAULT 0,
+                    old_faction TEXT NOT NULL DEFAULT '',
+                    old_server_id INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    step TEXT NOT NULL DEFAULT 'user_confirm'
+                );
+
+                CREATE TABLE IF NOT EXISTS hire_opt_out (
+                    vk_id INTEGER PRIMARY KEY
+                );
+
+                CREATE TABLE IF NOT EXISTS resign_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL UNIQUE,
+                    reason TEXT NOT NULL DEFAULT '',
+                    faction TEXT NOT NULL DEFAULT '',
+                    server_id INTEGER NOT NULL DEFAULT 1,
+                    leader_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    step TEXT NOT NULL DEFAULT 'user_confirm'
+                );
+
                 CREATE TABLE IF NOT EXISTS chat_disabled_commands (
                     chat_id INTEGER NOT NULL,
                     command TEXT NOT NULL,
@@ -668,6 +940,17 @@ class DB:
                     until_ts INTEGER NOT NULL,
                     PRIMARY KEY(chat_id, vk_id)
                 );
+                
+
+                CREATE TABLE IF NOT EXISTS chat_member_roles (
+                    chat_id INTEGER NOT NULL,
+                    vk_id INTEGER NOT NULL,
+                    role_name TEXT NOT NULL,
+                    assigned_at INTEGER DEFAULT 0,
+                    PRIMARY KEY(chat_id, vk_id, role_name)
+                );
+
+                
                 """
             )
             try:
@@ -710,6 +993,27 @@ class DB:
                 c.execute("ALTER TABLE registration_requests ADD COLUMN platform TEXT NOT NULL DEFAULT 'vk'")
             except sqlite3.OperationalError:
                 pass
+            # ... существующие ALTER TABLE ...
+            try:
+                c.execute("ALTER TABLE users ADD COLUMN platform TEXT DEFAULT 'vk'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE users ADD COLUMN nick2 TEXT DEFAULT NULL")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("""CREATE TABLE IF NOT EXISTS chat_invite_level (
+                    chat_id INTEGER PRIMARY KEY,
+                    min_role INTEGER NOT NULL DEFAULT 40,
+                    min_admin INTEGER NOT NULL DEFAULT 0
+                )""")
+            except Exception:
+                pass
+            try:
+                c.execute("CREATE TABLE IF NOT EXISTS chat_push_disabled (chat_id INTEGER PRIMARY KEY)")
+            except Exception:
+                pass
             try:
                 c.execute("ALTER TABLE chats ADD COLUMN server_id INTEGER NOT NULL DEFAULT 1")
             except sqlite3.OperationalError:
@@ -726,6 +1030,101 @@ class DB:
                 c.execute("ALTER TABLE notes ADD COLUMN attachments TEXT")
             except sqlite3.OperationalError:
                 pass
+            try:
+                c.execute("ALTER TABLE resign_requests ADD COLUMN server_id INTEGER NOT NULL DEFAULT 1")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("""CREATE TABLE IF NOT EXISTS chat_greetings (
+                    chat_id INTEGER PRIMARY KEY,
+                    text TEXT NOT NULL DEFAULT '',
+                    attachment TEXT NOT NULL DEFAULT '',
+                    sticker_id INTEGER,
+                    created_by INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )""")
+            except Exception:
+                pass
+            # Таблицы персональных разрешений/запретов команд
+            for _ddl2 in [
+                """CREATE TABLE IF NOT EXISTS user_cmd_allow (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_vk_id INTEGER NOT NULL,
+                    command TEXT NOT NULL COLLATE NOCASE,
+                    granted_by INTEGER NOT NULL,
+                    granted_at INTEGER NOT NULL,
+                    UNIQUE(target_vk_id, command COLLATE NOCASE)
+                )""",
+                """CREATE TABLE IF NOT EXISTS user_cmd_deny (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_vk_id INTEGER NOT NULL,
+                    command TEXT NOT NULL COLLATE NOCASE,
+                    denied_by INTEGER NOT NULL,
+                    denied_at INTEGER NOT NULL,
+                    UNIQUE(target_vk_id, command COLLATE NOCASE)
+                )""",
+            ]:
+                try:
+                    c.execute(_ddl2)
+                except Exception:
+                    pass
+            # dj_positions: добавляем UNIQUE по level (одно название на уровень)
+            try:
+                c.executescript("""
+                    CREATE TABLE IF NOT EXISTS dj_positions_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        faction TEXT NOT NULL,
+                        server_id INTEGER NOT NULL DEFAULT 1,
+                        level INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        UNIQUE(faction, server_id, level),
+                        UNIQUE(faction, server_id, name COLLATE NOCASE)
+                    );
+                    INSERT OR IGNORE INTO dj_positions_new(id,faction,server_id,level,name)
+                        SELECT id,faction,server_id,level,name FROM dj_positions;
+                    DROP TABLE dj_positions;
+                    ALTER TABLE dj_positions_new RENAME TO dj_positions;
+                """)
+            except Exception:
+                pass
+            # Создаём новые таблицы если БД уже существует
+            for _ddl in [
+                """CREATE TABLE IF NOT EXISTS dj_positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    faction TEXT NOT NULL,
+                    server_id INTEGER NOT NULL DEFAULT 1,
+                    level INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    UNIQUE(faction, server_id, name COLLATE NOCASE)
+                )""",
+                """CREATE TABLE IF NOT EXISTS dj_headers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    faction TEXT NOT NULL,
+                    server_id INTEGER NOT NULL DEFAULT 1,
+                    title TEXT NOT NULL,
+                    level_min INTEGER NOT NULL,
+                    level_max INTEGER NOT NULL,
+                    UNIQUE(faction, server_id, title COLLATE NOCASE)
+                )""",
+                """CREATE TABLE IF NOT EXISTS hire_offers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_user_id INTEGER NOT NULL,
+                    actor_user_id INTEGER NOT NULL,
+                    faction TEXT NOT NULL,
+                    server_id INTEGER NOT NULL DEFAULT 1,
+                    position_name TEXT NOT NULL,
+                    position_level INTEGER NOT NULL DEFAULT 0,
+                    old_faction TEXT NOT NULL DEFAULT '',
+                    old_server_id INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    step TEXT NOT NULL DEFAULT 'user_confirm'
+                )""",
+                "CREATE TABLE IF NOT EXISTS hire_opt_out (vk_id INTEGER PRIMARY KEY)",
+            ]:
+                try:
+                    c.execute(_ddl)
+                except Exception:
+                    pass
             try:
                 c.execute(
                     """
@@ -806,6 +1205,229 @@ class Ctx:
         return self.peer_id - 2_000_000_000 if self.is_chat else None
 
 
+# ---------------------------- БД Списков (с шифрованием) ----------------------------
+
+
+class ListsDB:
+    """
+    Отдельная зашифрованная БД для глобальных списков.
+    Содержимое каждого списка хранится в зашифрованном виде (XOR + base64).
+    Ключ шифрования = ENCRYPTION_KEY_A + ENCRYPTION_KEY_B.
+    Доступ контролируется полем min_admin_level.
+    """
+
+    def __init__(self, path: str, key_a: str, key_b: str) -> None:
+        self.path = path
+        self._key_a = key_a
+        self._key_b = key_b
+        self._init()
+
+    @staticmethod
+    def _xor_bytes(data: bytes, key: str) -> bytes:
+        k = key.encode("utf-8")
+        if not k:
+            return data
+        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data))
+
+    def _encrypt(self, text: str) -> str:
+        """Двойное XOR + base64url шифрование содержимого."""
+        raw = text.encode("utf-8")
+        step1 = self._xor_bytes(raw, self._key_a)
+        step2 = self._xor_bytes(step1, self._key_b)
+        return base64.urlsafe_b64encode(step2).decode("ascii")
+
+    def _decrypt(self, token: str) -> str:
+        """Обратное декодирование."""
+        try:
+            b = base64.urlsafe_b64decode(token.encode("ascii"))
+            step1 = self._xor_bytes(b, self._key_b)
+            step2 = self._xor_bytes(step1, self._key_a)
+            return step2.decode("utf-8")
+        except Exception:
+            return ""
+
+    def conn(self) -> sqlite3.Connection:
+        c = sqlite3.connect(self.path, timeout=10)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        # Дополнительная защита: запретить внешний доступ через SQLite ATTACH
+        c.execute("PRAGMA trusted_schema=OFF")
+        return c
+
+    def _init(self) -> None:
+        with self.conn() as c:
+            c.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS global_lists (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    min_admin_level INTEGER NOT NULL DEFAULT 0,
+                    creator_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    content_enc TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_global_lists_admin ON global_lists(min_admin_level);
+
+                CREATE TABLE IF NOT EXISTS list_access (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    list_name TEXT NOT NULL COLLATE NOCASE,
+                    vk_id INTEGER NOT NULL,
+                    granted_by INTEGER NOT NULL,
+                    granted_at INTEGER NOT NULL,
+                    UNIQUE(list_name, vk_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_list_access_name ON list_access(LOWER(list_name));
+                CREATE INDEX IF NOT EXISTS idx_list_access_user ON list_access(vk_id);
+                """
+            )
+
+    def create_list(self, name: str, min_admin: int, creator_id: int, ts: int) -> bool:
+        """Создать новый список. Возвращает False если имя уже занято."""
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT INTO global_lists(name,min_admin_level,creator_id,created_at,updated_at,content_enc) VALUES(?,?,?,?,?,?)",
+                    (name.strip(), int(min_admin), int(creator_id), ts, ts, self._encrypt("")),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def delete_list(self, name: str) -> bool:
+        with self.conn() as c:
+            cur = c.execute("DELETE FROM global_lists WHERE name=?", (name.strip(),))
+            return cur.rowcount > 0
+
+    def get_list(self, name: str, user_admin_level: int, vk_id: Optional[int] = None) -> Optional[dict]:
+        """Получить список, если у пользователя есть права доступа.
+        Поиск без учёта регистра. Уровень 0 = доступно всем.
+        Если vk_id указан — проверяется также персональный доступ.
+        """
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT id,name,min_admin_level,creator_id,created_at,updated_at,content_enc FROM global_lists WHERE LOWER(name)=LOWER(?)",
+                (name.strip(),),
+            ).fetchone()
+        if not row:
+            return None
+        min_adm = int(row["min_admin_level"])
+        # Проверяем доступ по уровню
+        has_level_access = (min_adm == 0 or user_admin_level >= min_adm)
+        if not has_level_access:
+            # Проверяем персональный доступ
+            if vk_id is None:
+                return None
+            with self.conn() as c:
+                personal = c.execute(
+                    "SELECT 1 FROM list_access WHERE LOWER(list_name)=LOWER(?) AND vk_id=?",
+                    (name.strip(), int(vk_id)),
+                ).fetchone()
+            if not personal:
+                return None
+        content = self._decrypt(str(row["content_enc"]))
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "min_admin_level": row["min_admin_level"],
+            "creator_id": row["creator_id"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "content": content,
+        }
+
+    def update_list(self, name: str, new_content: str, ts: int) -> bool:
+        enc = self._encrypt(new_content)
+        with self.conn() as c:
+            cur = c.execute(
+                "UPDATE global_lists SET content_enc=?, updated_at=? WHERE name=? COLLATE NOCASE",
+                (enc, ts, name.strip()),
+            )
+            return cur.rowcount > 0
+
+    # ── Персональный доступ ────────────────────────────────────────────────
+
+    def grant_access(self, list_name: str, vk_id: int, granted_by: int, ts: int) -> tuple[bool, str]:
+        """Выдать персональный доступ к списку. Возвращает (ok, сообщение)."""
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM global_lists WHERE LOWER(name)=LOWER(?)", (list_name.strip(),)
+            ).fetchone()
+        if not row:
+            return False, f"Список «{list_name}» не найден."
+        try:
+            with self.conn() as c:
+                c.execute(
+                    "INSERT OR REPLACE INTO list_access(list_name,vk_id,granted_by,granted_at) VALUES(?,?,?,?)",
+                    (list_name.strip(), int(vk_id), int(granted_by), ts),
+                )
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    def revoke_access(self, list_name: str, vk_id: int) -> bool:
+        """Отозвать персональный доступ."""
+        with self.conn() as c:
+            cur = c.execute(
+                "DELETE FROM list_access WHERE LOWER(list_name)=LOWER(?) AND vk_id=?",
+                (list_name.strip(), int(vk_id)),
+            )
+        return cur.rowcount > 0
+
+    def get_access_entries(self, list_name: str) -> list[dict]:
+        """Все персональные доступы к конкретному списку."""
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT vk_id, granted_by, granted_at FROM list_access "
+                "WHERE LOWER(list_name)=LOWER(?) ORDER BY granted_at",
+                (list_name.strip(),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def has_access(self, list_name: str, user_admin_level: int, vk_id: int) -> bool:
+        """Проверяет доступ: по уровню admin ИЛИ персональный."""
+        with self.conn() as c:
+            row = c.execute(
+                "SELECT min_admin_level FROM global_lists WHERE LOWER(name)=LOWER(?)",
+                (list_name.strip(),),
+            ).fetchone()
+        if not row:
+            return False
+        min_adm = int(row["min_admin_level"])
+        if min_adm == 0 or user_admin_level >= min_adm:
+            return True
+        # Проверяем персональный доступ
+        with self.conn() as c:
+            personal = c.execute(
+                "SELECT 1 FROM list_access WHERE LOWER(list_name)=LOWER(?) AND vk_id=?",
+                (list_name.strip(), int(vk_id)),
+            ).fetchone()
+        return bool(personal)
+
+    def all_lists(self, user_admin_level: int, vk_id: Optional[int] = None) -> list[dict]:
+        """Вернуть все списки, доступные данному пользователю.
+        Учитывает: уровень admin + персональный доступ.
+        """
+        with self.conn() as c:
+            if vk_id is not None:
+                rows = c.execute(
+                    "SELECT DISTINCT g.id,g.name,g.min_admin_level,g.creator_id,g.created_at,g.updated_at "
+                    "FROM global_lists g "
+                    "LEFT JOIN list_access la ON LOWER(la.list_name)=LOWER(g.name) AND la.vk_id=? "
+                    "WHERE g.min_admin_level=0 OR g.min_admin_level<=? OR la.vk_id IS NOT NULL "
+                    "ORDER BY g.name COLLATE NOCASE",
+                    (int(vk_id), int(user_admin_level)),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT id,name,min_admin_level,creator_id,created_at,updated_at FROM global_lists "
+                    "WHERE min_admin_level=0 OR min_admin_level<=? ORDER BY name COLLATE NOCASE",
+                    (int(user_admin_level),),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+
 class FactionBot:
     def __init__(self, token: str, group_id: int, db: DB):
         self.db = db
@@ -832,8 +1454,19 @@ class FactionBot:
         self.chat_command_history: dict[int, deque[tuple[int, str, int]]] = defaultdict(lambda: deque(maxlen=200))
         self._current_user_for_parse: Optional[int] = None
         self.tg_senior_admin_runtime_id: Optional[int] = None
+        # Пул потоков для параллельного выполнения команд
+        self._cmd_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="cmd")
+        # Инициализация БД списков
+        self.lists_db = ListsDB(
+            path=LISTS_DB_PATH,
+            key_a=ENCRYPTION_KEY_A,
+            key_b=ENCRYPTION_KEY_B,
+        )
 
     # ---------- infra ----------
+    def _get_silence_admin_threshold(self) -> int:
+        #Возвращает админ-уровень, дающий иммунитет к тишине"""
+        return int(self._get_setting("silence_admin_threshold", "40"))
 
     def _resolve_route(self, peer_id: int) -> tuple[str, int]:
         route = self.peer_routes.get(peer_id)
@@ -1157,6 +1790,38 @@ class FactionBot:
                 (chat_id, 0, DEFAULT_ROLE_NAME),
             )
 
+    def _parse_user_fast(self, token: str) -> Optional[int]:
+        """Быстрый парсинг пользователя без VK API запросов.
+        Работает только с числовыми id, [idXXX|...] упоминаниями и @цифры.
+        Не делает resolveScreenName — используйте для горячих команд (!админ и т.п.)
+        """
+        token = token.strip()
+        if token.lower() in {"я", "i"} and self._current_user_for_parse is not None:
+            return int(self._current_user_for_parse)
+        # Числовой id
+        if token.isdigit():
+            return int(token)
+        # [idXXX|имя]
+        m = re.search(r"\[(?:id)?(\d+)\|", token)
+        if m:
+            return int(m.group(1))
+        # @цифры
+        if token.startswith("@") and token[1:].isdigit():
+            return int(token[1:])
+        # id123 без скобок
+        m = re.match(r"^id(\d+)$", token, re.I)
+        if m:
+            return int(m.group(1))
+        # Из БД по нику (без VK API)
+        with self.db.conn() as c:
+            row = c.execute(
+                "SELECT vk_id FROM users WHERE LOWER(COALESCE(nickname,''))=LOWER(?) LIMIT 1",
+                (token,),
+            ).fetchone()
+            if row:
+                return int(row["vk_id"])
+        return None
+
     def _parse_user(self, token: str) -> Optional[int]:
         token = token.strip()
         if token.lower() in {"я", "i"} and self._current_user_for_parse is not None:
@@ -1239,33 +1904,47 @@ class FactionBot:
         return self._resolve_alias(cmd)
 
     def _extract_command_token(self, raw_tokens: list[str]) -> Optional[str]:
+        """Извлекает каноническое имя команды из списка токенов.
+        Поддерживает многословные команды: '!дж заголовок', '!новый список', и т.д.
+        Алгоритм: пробуем самую длинную подстроку токенов, которая есть в COMMAND_ACCESS.
+        """
         if not raw_tokens:
             return None
         tokens = [t.strip().lower() for t in raw_tokens if t and t.strip()]
         if not tokens:
             return None
-        first = tokens[0]
-        first_norm = self._normalize_command_name(first)
-        if first_norm == "!допрассм":
-            return "!допрассм"
-        pair = " ".join(tokens[:2])
-        mapping = {
-            "!создать роль": "!создать",
-            "создать роль": "!создать",
-            "!блок чат": "!блок",
-            "блок чат": "!блок",
-            "!разблок чат": "!разблок",
-            "разблок чат": "!разблок",
-            "!список допрассм": "!списокдопрассм",
-            "список допрассм": "!списокдопрассм",
-            "!удалить инфу": "!удалитьинфу",
-            "удалить инфу": "!удалитьинфу",
-        }
-        if pair in mapping:
-            return mapping[pair]
-        return first_norm
+        # Нормализуем каждый токен
+        normalized_tokens = []
+        for t in tokens:
+            n = t if t.startswith("!") else f"!{t}"
+            normalized_tokens.append(n)
+
+        # Пробуем от самого длинного совпадения к самому короткому
+        for length in range(len(normalized_tokens), 0, -1):
+            candidate = " ".join(normalized_tokens[:length])
+            # Убираем ! со второго слова и далее для многословных команд
+            # (команды хранятся как "!дж заголовок", "!новый список" и т.п.)
+            if length > 1:
+                parts_cand = normalized_tokens[:length]
+                # Первое слово с !, остальные без
+                candidate_clean = parts_cand[0] + " " + " ".join(p.lstrip("!") for p in parts_cand[1:])
+            else:
+                candidate_clean = normalized_tokens[0]
+            if candidate_clean in COMMAND_ACCESS:
+                return candidate_clean
+            # Также пробуем через _resolve_alias
+            resolved = self._resolve_alias(candidate_clean)
+            if resolved in COMMAND_ACCESS:
+                return resolved
+
+        # Fallback: первый токен через normalize
+        return self._normalize_command_name(tokens[0])
 
     def _get_admin_min(self, cmd: str) -> int:
+        """Возвращает минимальный admin_level для команды.
+        Если переопределено через !админправо — возвращает это значение (может быть 0).
+        Если не переопределено — возвращает дефолт из ADMIN_MIN/COMMAND_ACCESS.
+        """
         normalized = self._normalize_command_name(cmd)
         with self.db.conn() as c:
             row = c.execute("SELECT min_admin FROM command_admin_rights WHERE command=?", (normalized,)).fetchone()
@@ -1276,18 +1955,70 @@ class FactionBot:
             return int(row[0])
         return ADMIN_MIN.get(normalized, 0)
 
+    def _get_effective_admin_min(self, cmd: str) -> int:
+        """Возвращает итоговый минимальный admin_level с учётом всех источников.
+        Порядок приоритетов:
+          1. Если !админправо переопределило команду — берём это значение (даже 0).
+          2. Иначе берём COMMAND_ACCESS[cmd]["admin_default"].
+          3. Иначе ADMIN_MIN.get(cmd, 0).
+        """
+        normalized = self._normalize_command_name(cmd)
+        with self.db.conn() as c:
+            row = c.execute("SELECT min_admin FROM command_admin_rights WHERE command=?", (normalized,)).fetchone()
+            if not row and normalized.startswith("!"):
+                row = c.execute(
+                    "SELECT min_admin FROM command_admin_rights WHERE command=?", (normalized[1:],)
+                ).fetchone()
+        if row is not None:
+            # Явное переопределение через !админправо — оно главное
+            return int(row[0])
+        # Нет переопределения — берём из кода
+        code_val = COMMAND_ACCESS.get(cmd, {}).get("admin_default", 0)
+        if code_val > 0:
+            return code_val
+        return ADMIN_MIN.get(normalized, 0)
+
     def _record_failed_access(self, user_id: int, reason: str) -> None:
+        """Записывает неудачную попытку доступа.
+        При 5+ попытках за 5 минут — уведомляет лог-чат.
+        При 15+ попытках за 5 минут — автоматический ботбан (защита от брутфорса).
+        """
+        if int(user_id) == int(self.db.senior_admin_id):
+            return  # Старшего админа никогда не баним
+        # Не баним пользователей фракции Админ и с высоким admin_level
+        if self._is_admin_faction_user(user_id) or self._get_admin_level(user_id) >= 50:
+            return
         now = self.now_ts()
         dq = self.failed_access_window[user_id]
         dq.append(now)
         while dq and now - dq[0] > 300:
             dq.popleft()
-        if len(dq) >= 5:
-            log_chat_id = int(self._get_setting("log_chat_id", "0") or 0)
+        attempts = len(dq)
+        log_chat_id = int(self._get_setting("log_chat_id", "0") or 0)
+        if attempts >= 5:
             if log_chat_id > 0:
                 self._logging_in_progress = True
                 try:
-                    self.send_chat(log_chat_id, f"⚠️ Аномалия доступа: {self._fmt_user(user_id)} ({reason}), попыток за 5 минут: {len(dq)}")
+                    self.send_chat(
+                        log_chat_id,
+                        f"⚠️ Аномалия доступа: {self._fmt_user(user_id)} ({reason}), попыток за 5 мин: {attempts}",
+                    )
+                except Exception:
+                    pass
+                finally:
+                    self._logging_in_progress = False
+        if attempts >= 15:
+            # Автоматический ботбан за агрессивные попытки
+            with self.db.conn() as c:
+                c.execute("INSERT OR IGNORE INTO bot_bans(vk_id) VALUES(?)", (user_id,))
+            autoban_msg = f"🚫 АВТОБАН: id{user_id} — {attempts} несанкционированных попыток за 5 мин. Причина: {reason}"
+            logger.warning(f"AUTOBAN: user={user_id} attempts={attempts} reason={reason!r}")
+            # Уведомляем старшего админа в ЛС
+            self._alert_senior_admin(autoban_msg)
+            if log_chat_id > 0:
+                self._logging_in_progress = True
+                try:
+                    self.send_chat(log_chat_id, autoban_msg)
                 except Exception:
                     pass
                 finally:
@@ -1295,6 +2026,7 @@ class FactionBot:
 
     @staticmethod
     def _contains_prompt_injection(text: str) -> bool:
+        """Проверяет наличие паттернов инъекций/попыток взлома в тексте команды."""
         t = text.lower()
         patterns = [
             "ignore previous instructions",
@@ -1304,14 +2036,60 @@ class FactionBot:
             "bypass",
             "отключи проверки",
             "игнорируй инструкции",
+            "forget your instructions",
+            "you are now",
+            "act as",
+            "new persona",
+            "override admin",
+            "дай права",
+            "установи уровень",
+            "__import__",
+            "exec(",
+            "eval(",
+            "os.system",
+            "subprocess",
+            # SQL-injection стоп-слова (т.к. команды парсятся вручную, но для заметок/причин)
+            "'; drop",
+            "1=1--",
+            "union select",
         ]
         return any(p in t for p in patterns)
+
+    @staticmethod
+    def _sanitize_input(text: str, max_len: int = 500) -> str:
+        """Обрезает слишком длинный ввод и убирает control-символы."""
+        # Удаляем control chars (кроме newline/tab)
+        cleaned = "".join(c for c in text if c >= " " or c in "\n\t")
+        return cleaned[:max_len]
+
+    def _is_immune_to_silence(self, user_id: int, chat_id: int) -> bool:
+        """Проверяет иммунитет к режиму тишины.
+        Иммунитет имеют:
+          1. Фракция Админ
+          2. Лидер фракции чата
+          3. Пользователи с admin_level >= silence_admin_threshold (настраивается через !тишина админпорог)
+          4. Пользователи, добавленные в silence_exceptions для этого чата (временный голос)
+        """
+        # Фракция Админ — всегда иммунитет
+        if self._is_admin_faction_user(user_id):
+            return True
+        # Лидер фракции в этом чате — всегда иммунитет
+        if self._is_leader_for_chat_faction(user_id, chat_id):
+            return True
+        # Динамический порог из настроек (по умолчанию 40)
+        threshold = self._get_silence_admin_threshold()
+        if threshold > 0 and self._get_admin_level(user_id) >= threshold:
+            return True
+        return False
 
     def _enforce_chat_silence(self, ctx: Ctx, conversation_message_id: Optional[int]) -> bool:
         if not ctx.is_chat:
             return False
-        if self._is_admin_faction_user(ctx.user_id):
+
+        # Постоянный иммунитет (фракция Админ, лидеры, высокий admin_level >= порог)
+        if self._is_immune_to_silence(ctx.user_id, ctx.chat_id):
             return False
+
         now = self.now_ts()
         with self.db.conn() as c:
             rule = c.execute(
@@ -1320,13 +2098,19 @@ class FactionBot:
             ).fetchone()
             if not rule or int(rule["enabled"] or 0) == 0:
                 return False
+            # Временный голос (silence_exceptions)
             ex = c.execute(
                 "SELECT until_ts FROM silence_exceptions WHERE chat_id=? AND vk_id=?",
                 (ctx.chat_id, ctx.user_id),
             ).fetchone()
-            if ex and int(ex["until_ts"] or 0) > now:
-                return False
-            c.execute("DELETE FROM silence_exceptions WHERE chat_id=? AND vk_id=? AND until_ts<=?", (ctx.chat_id, ctx.user_id, now))
+            if ex:
+                if int(ex["until_ts"] or 0) > now:
+                    return False  # Временный голос активен
+                else:
+                    c.execute(
+                        "DELETE FROM silence_exceptions WHERE chat_id=? AND vk_id=?",
+                        (ctx.chat_id, ctx.user_id),
+                    )
         window_sec = int(rule["window_min"]) * 60
         limit = int(rule["msg_limit"])
         key = (ctx.chat_id, ctx.user_id)
@@ -1384,6 +2168,8 @@ class FactionBot:
     @staticmethod
     def _xor_bytes(data: bytes, key: str) -> bytes:
         k = key.encode("utf-8")
+        if not k:
+            return data  # пустой ключ → без шифрования
         return bytes(b ^ k[i % len(k)] for i, b in enumerate(data))
 
     def _double_encrypt(self, text: str) -> str:
@@ -1519,9 +2305,23 @@ class FactionBot:
 
     @staticmethod
     def _resolve_alias(cmd: str) -> str:
+        """Нормализует команду: сначала точный поиск по алиасам,
+        затем нечёткое сопоставление через расстояние Левенштейна."""
+        # 1. Точное совпадение
         for canonical, aliases in COMMAND_ALIASES.items():
             if cmd == canonical or cmd in aliases:
                 return canonical
+        # 2. Точное совпадение с известными командами
+        if cmd in COMMAND_ACCESS:
+            return cmd
+        # 3. Нечёткое сопоставление
+        fuzzy = _fuzzy_resolve_command(cmd)
+        if fuzzy != cmd:
+            # Ещё раз прогоняем через алиасы на случай если fuzzy вернул алиас
+            for canonical, aliases in COMMAND_ALIASES.items():
+                if fuzzy == canonical or fuzzy in aliases:
+                    return canonical
+            return fuzzy
         return cmd
 
     def _get_role_level(self, chat_id: int, user_id: int) -> int:
@@ -1624,10 +2424,36 @@ class FactionBot:
         return int(row[0]) if row else DEFAULT_COMMAND_RIGHTS.get(normalized, 0)
 
     def _has_access(self, ctx: Ctx, cmd: str) -> bool:
+        """Проверяет доступ пользователя к команде.
+
+        Приоритет правил:
+        1. Старший админ → всегда True.
+        2. Ботбан → всегда False.
+        3. Персональный запрет (!запретить) → False.
+        4. Персональное разрешение (!разрешить) → True.
+        5. Команда отключена в этом чате → False.
+        6. Спецкейсы (!изменить, !чат для лидера).
+        7. effective_admin_min → check admin_level и role.
+        """
         if self._is_senior_admin_ctx(ctx):
             return True
         if self._is_bot_banned(ctx.user_id):
             return False
+        cmd_norm = self._normalize_command_name(cmd)
+        # Персональные запреты/разрешения — один запрос
+        with self.db.conn() as c:
+            denied = c.execute(
+                "SELECT 1 FROM user_cmd_deny WHERE target_vk_id=? AND LOWER(command)=LOWER(?)",
+                (ctx.user_id, cmd_norm),
+            ).fetchone()
+            allowed = c.execute(
+                "SELECT 1 FROM user_cmd_allow WHERE target_vk_id=? AND LOWER(command)=LOWER(?)",
+                (ctx.user_id, cmd_norm),
+            ).fetchone()
+        if denied:
+            return False
+        if allowed:
+            return True
         if ctx.is_chat:
             with self.db.conn() as c:
                 off = c.execute(
@@ -1636,28 +2462,40 @@ class FactionBot:
                 ).fetchone()
             if off:
                 return False
+
         admin_lvl = self._get_admin_level(ctx.user_id)
+
+        # ── Спецкейсы ─────────────────────────────────────────────────────────
         if cmd == "!изменить":
             return admin_lvl >= 50 or (5 <= admin_lvl <= 10)
         if cmd == "!чат" and ctx.is_chat and self._is_leader_user(ctx.user_id):
             return True
-        min_admin = self._get_admin_min(cmd)
-        if cmd in COMMAND_ACCESS and COMMAND_ACCESS[cmd]["user_default"] == 0 and min_admin > 0:
-            if admin_lvl >= min_admin:
+
+        # ── Вычисляем effective_admin_min ─────────────────────────────────────
+        # Использует _get_effective_admin_min: учитывает !админправо + код + ADMIN_MIN
+        # !админправо имеет наивысший приоритет и может менять порог в любую сторону.
+        effective_admin_min = self._get_effective_admin_min(cmd)
+
+        # ── Команды с требованием admin_level ────────────────────────────────
+        if effective_admin_min > 0:
+            if admin_lvl >= effective_admin_min:
                 return True
+            # admin_level недостаточен. Роль помогает ТОЛЬКО при явном кастомном праве.
             if ctx.is_chat and self._has_custom_role_right(ctx.chat_id, cmd):
                 role_lvl = self._get_role_level(ctx.chat_id, ctx.user_id)
                 return role_lvl >= self._required_role(cmd, ctx.chat_id)
+            # Нет кастомного права → доступ закрыт, даже с высокой ролью
             return False
-        if cmd in {"!чс", "!списокчс", "!снятьчс"}:
-            return admin_lvl >= 10
-        if admin_lvl >= min_admin:
-            return True
+
+        # ── Публичные команды (effective_admin_min == 0) ──────────────────────
+        # Чат-only команды недоступны в ЛС
         if not ctx.is_chat and cmd in {
             "!бан", "!кик", "!разбан", "!мут", "!размут", "!роли", "!создать", "!роль",
-            "!снять", "!переименовать", "!пуш", "!банлист", "!мутлист", "!новоеприветствие", "!удалитьприветствие", "!заметка",
-            "!заметки", "!иммунитет", "!снятьиммунитет", "!иммунитеты", "!право", "!пред", "!повысить", "!понизить",
-            "!админы", "!снятьпред", "!списокпредов", "!выговор", "!список",
+            "!снять", "!переименовать", "!пуш", "!банлист", "!мутлист",
+            "!новоеприветствие", "!удалитьприветствие", "!заметка", "!заметки",
+            "!иммунитет", "!снятьиммунитет", "!иммунитеты", "!право", "!пред",
+            "!повысить", "!понизить", "!админы", "!снятьпред", "!списокпредов",
+            "!выговор", "!список",
         }:
             return False
         if ctx.is_chat:
@@ -2050,6 +2888,7 @@ class FactionBot:
                 self.send(ctx.peer_id, "✅ Регистрация отменена. Чтобы начать заново, используйте /start.")
                 return True
             stage = sess["stage"]
+
             if stage == "server":
                 server_text = ctx.text.strip()
                 if server_text not in {"1", "2", "3"}:
@@ -2061,10 +2900,15 @@ class FactionBot:
                 )
                 self.send(ctx.peer_id, "Введите ваш NickName на сервере:")
                 return True
+
             if stage == "nickname":
+                nick_input = ctx.text.strip()
+                if not nick_input:
+                    self.send(ctx.peer_id, "❌ NickName не может быть пустым. Введите ваш NickName:")
+                    return True
                 c.execute(
                     "UPDATE registration_sessions SET stage='faction', nickname=? WHERE vk_id=?",
-                    (ctx.text.strip(), ctx.user_id),
+                    (nick_input, ctx.user_id),
                 )
                 self.send_with_keyboard(
                     ctx.peer_id,
@@ -2072,6 +2916,7 @@ class FactionBot:
                     self._registration_faction_buttons(),
                 )
                 return True
+
             if stage == "faction":
                 faction = ctx.text.strip()
                 if faction not in FACTIONS:
@@ -2087,62 +2932,100 @@ class FactionBot:
                 )
                 self.send(ctx.peer_id, "🧾 Введите РП ФИО (самостоятельно изменить потом нельзя):")
                 return True
+
             if stage == "rp_name":
+                rp_input = ctx.text.strip()
+                if not rp_input:
+                    self.send(ctx.peer_id, "❌ РП ФИО не может быть пустым. Введите РП ФИО:")
+                    return True
                 c.execute(
                     "UPDATE registration_sessions SET stage='position', rp_name=? WHERE vk_id=?",
-                    (ctx.text.strip(), ctx.user_id),
+                    (rp_input, ctx.user_id),
                 )
                 self.send(ctx.peer_id, "💼 Введите должность:")
                 return True
+
             if stage == "position":
                 position = ctx.text.strip()
+                if not position:
+                    self.send(ctx.peer_id, "❌ Должность не может быть пустой. Введите должность:")
+                    return True
+
                 nickname = sess["nickname"]
                 faction = sess["faction"]
                 rp_name = sess["rp_name"]
                 server_id = int(sess["server_id"] or 1)
+
+                # Защита от дублирования: проверяем нет ли уже pending заявки от этого пользователя
+                existing = c.execute(
+                    "SELECT id FROM registration_requests WHERE vk_id=? AND status='pending'",
+                    (ctx.user_id,),
+                ).fetchone()
+                if existing:
+                    # Сессию чистим, но не создаём новую заявку
+                    c.execute("DELETE FROM registration_sessions WHERE vk_id=?", (ctx.user_id,))
+                    self.send(
+                        ctx.peer_id,
+                        f"⚠️ У вас уже есть заявка #{existing['id']} на рассмотрении. Ждите решения Лидера фракции.",
+                    )
+                    return True
+
+                # Вставляем заявку — ТОЛЬКО в стадии position
                 cur = c.execute(
-                    "INSERT INTO registration_requests(vk_id,server_id,platform,nickname,faction,rp_name,position,status) VALUES(?,?,?,?,?,?,?,'pending')",
+                    "INSERT INTO registration_requests(vk_id,server_id,platform,nickname,faction,rp_name,position,status)"
+                    " VALUES(?,?,?,?,?,?,?,'pending')",
                     (ctx.user_id, server_id, ctx.platform, nickname, faction, rp_name, position),
                 )
-                req_id = int(cur.lastrowid)
+                req_id = cur.lastrowid
+                if not req_id:
+                    req_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+                # Создаём/обновляем запись пользователя (не одобрен)
                 c.execute(
-                    "INSERT OR REPLACE INTO users(vk_id,nickname,rp_name,position,faction,server_id,approved,admin_level,bot_ban,consent_accepted,consent_accepted_at) VALUES(?,?,?,?,?,?,0,0,0,1,?)",
+                    "INSERT OR REPLACE INTO users"
+                    "(vk_id,nickname,rp_name,position,faction,server_id,approved,admin_level,bot_ban,consent_accepted,consent_accepted_at)"
+                    " VALUES(?,?,?,?,?,?,0,0,0,1,?)",
                     (ctx.user_id, nickname, rp_name, position, faction, server_id, self.now_ts()),
                 )
+                # Удаляем сессию ПОСЛЕ успешной вставки
                 c.execute("DELETE FROM registration_sessions WHERE vk_id=?", (ctx.user_id,))
 
-                text = (
-                    f"📥 Новая заявка #{req_id}\n"
-                    f"Пользователь: {self._fmt_user(ctx.user_id)}\nNick: {nickname}\nФракция: {faction}\nСервер: {server_id}\nРП ФИО: {rp_name}\n"
-                    f"Должность: {position}\nИсточник: {'Telegram' if ctx.platform == 'tg' else 'VK'}\n\n"
-                    "Ответ: !одобрить (номер) или !отказать (номер)"
-                )
+                # Подтверждение пользователю (без "Ожидайте ответа" — лишнее)
                 self.send(
                     ctx.peer_id,
-                    f"🕒 Заявка #{req_id} отправлена на одобрение.\n"
-                    "До одобрения заявки использование бота ограничено.",
+                    f"✅ Заявка #{req_id} отправлена. Ожилайте ответа!\n"
+                    f"Ник: {nickname} | Фракция: {faction} | Сервер: {server_id}\n"
+                    f"РП ФИО: {rp_name} | Должность: {position}",
                 )
-                delivered = False
-                try:
-                    delivered = self._notify_registration_reviewers(req_id, faction, server_id, text)
-                except Exception:
-                    delivered = False
-                if not delivered:
-                    print(
-                        f"[BOT] Не удалось отправить заявку #{req_id} получателям рассмотрения (нет ЛС-доступа).",
-                        file=sys.stderr,
-                    )
-                self._add_history(
-                    nickname=nickname,
-                    target_vk_id=ctx.user_id,
-                    old_faction=None,
-                    old_position=None,
-                    new_faction=faction,
-                    new_position=position,
-                    actor_vk_id=None,
-                    event_type="registration",
+
+                # Текст для рассматривающих
+                review_text = (
+                    f"📥 Новая заявка #{req_id}\n"
+                    f"Пользователь: {self._fmt_user(ctx.user_id)}\n"
+                    f"Ник: {nickname} | Фракция: {faction} | Сервер: {server_id}\n"
+                    f"РП ФИО: {rp_name} | Должность: {position}\n"
+                    f"Платформа: {'Telegram' if ctx.platform == 'tg' else 'VK'}\n\n"
+                    "Действие: !одобрить (номер) или !отказать (номер)"
                 )
-                return True
+
+        # Уведомляем рассматривающих ВНЕ транзакции (не блокируем БД)
+        delivered = self._notify_registration_reviewers(req_id, faction, server_id, review_text)
+        if not delivered:
+            logger.info(f"Заявка #{req_id}: не удалось отправить рассматривающим.",
+                file=sys.stderr,)
+
+        self._add_history(
+            nickname=nickname,
+            target_vk_id=ctx.user_id,
+            old_faction=None,
+            old_position=None,
+            new_faction=faction,
+            new_position=position,
+            actor_vk_id=None,
+            event_type="registration",
+        )
+        return True
+
         return False
 
     # ---------- commands ----------
@@ -2163,20 +3046,25 @@ class FactionBot:
         role_lvl = self._get_role_level(ctx.chat_id, ctx.user_id) if ctx.is_chat else 0
         hidden_in_chat = bool(u and int(u["hidden"] or 0) == 1 and ctx.is_chat)
         nick = u["nickname"] if u and u["nickname"] else "не указан"
+        nick2 = (u["nick2"] if "nick2" in u.keys() else None) if u else None
         position = u["position"] if u and u["position"] else "не указана"
         faction = u["faction"] if u and u["faction"] else "не указана"
         if hidden_in_chat:
             nick = "(скрыто)"
+            nick2 = None
             position = "(скрыто)"
             faction = "(скрыто)"
         pref_line = "\n🧷 Префиксы: нет"
         if pref:
             pref_line = "\n🧷 Префиксы: " + ", ".join([f"{p['name']} {p['emoji']}" for p in pref])
+        nick_str = nick
+        if nick2:
+            nick_str += f" ({nick2})"
         self.send(
             ctx.peer_id,
             (
                 "👤 Ваш профиль\n"
-                f"• Ник: {nick}\n"
+                f"• Ник: {nick_str}\n"
                 f"• Должность: {position}\n"
                 f"• Фракция: {faction}\n"
                 f"• Сервер: {u['server_id'] if u and u['server_id'] else 1}\n"
@@ -2187,35 +3075,61 @@ class FactionBot:
         )
 
     def _registration_reviewer_ids(self, faction: str, server_id: int) -> list[int]:
+        """Возвращает список VK id всех получателей заявки данной фракции/сервера.
+        Порядок: лидер → доп. рассматривающие → старший admin.
+        """
         with self.db.conn() as c:
-            leader = c.execute("SELECT vk_id FROM leaders WHERE faction=? AND server_id=?", (faction, server_id)).fetchone()
-            rows = c.execute(
+            # Ищем лидера конкретного сервера
+            leader = c.execute(
+                "SELECT vk_id FROM leaders WHERE faction=? AND server_id=?",
+                (faction, int(server_id)),
+            ).fetchone()
+            # Доп. рассматривающие для фракции+сервера
+            extra_rows = c.execute(
                 "SELECT vk_id FROM extra_reviewers WHERE faction=? AND server_id=? ORDER BY vk_id",
-                (faction, server_id),
+                (faction, int(server_id)),
+            ).fetchall()
+            # Также доп. рассматривающие без привязки к серверу (server_id=0 как "все серверы")
+            extra_any = c.execute(
+                "SELECT vk_id FROM extra_reviewers WHERE faction=? AND server_id=0 ORDER BY vk_id",
+                (faction,),
             ).fetchall()
         out: list[int] = []
         if leader:
-            out.append(int(leader["vk_id"] if isinstance(leader, sqlite3.Row) else leader[0]))
-        for r in rows:
+            lid = int(leader["vk_id"] if isinstance(leader, sqlite3.Row) else leader[0])
+            out.append(lid)
+        for r in list(extra_rows) + list(extra_any):
             uid = int(r["vk_id"])
             if uid not in out:
                 out.append(uid)
-        if self.db.senior_admin_id not in out:
-            out.append(int(self.db.senior_admin_id))
+        # Старший админ получает заявку только если нет других получателей
+        if not out:
+            senior = int(self.db.senior_admin_id)
+            out.append(senior)
         return out
 
     def _notify_registration_reviewers(self, request_id: int, faction: str, server_id: int, text: str) -> bool:
+        """Отправляет заявку всем рассматривающим и записывает их в БД.
+        Сначала все записи в БД, потом отправка сообщений — чтобы не держать
+        транзакцию открытой во время сетевых запросов к VK API.
+        """
         recipients = self._registration_reviewer_ids(faction, server_id)
-        delivered_any = False
+        # Сначала записываем получателей в БД (быстро, без API)
         with self.db.conn() as c:
             for to_user in recipients:
-                delivered = self.send_dm_vk_with_inline(to_user, text, request_id)
-                if delivered:
-                    delivered_any = True
                 c.execute(
                     "INSERT OR IGNORE INTO registration_review_recipients(request_id,vk_id) VALUES(?,?)",
                     (request_id, to_user),
                 )
+        # Потом отправляем сообщения (медленно, сеть) — БД уже не заблокирована
+        delivered_any = False
+        for to_user in recipients:
+            try:
+                ok = self.send_dm_vk_with_inline(to_user, text, request_id)
+                if ok:
+                    delivered_any = True
+            except Exception as e:
+                logger.error(f"Ошибка отправки заявки #{request_id} пользователю {to_user}: {e}")
         return delivered_any
 
     def _approve_reject_by_id(self, actor_id: int, peer_id: int, req_id: int, approve: bool, actor_platform: str = "vk", actor_username: Optional[str] = None) -> str:
@@ -2313,9 +3227,13 @@ class FactionBot:
             pref = c.execute("SELECT name,emoji FROM user_prefixes WHERE vk_id=? ORDER BY name", (target_id,)).fetchall()
         if not u:
             return f"Пользователь {self._fmt_user(target_id)} не найден в БД."
+        nick2_val = u["nick2"] if "nick2" in u.keys() and u["nick2"] else None
+        nick_display = (u["nickname"] or "не указан")
+        if nick2_val:
+            nick_display += f" ({nick2_val})"
         lines = [
             f"👤 Профиль {self._fmt_user(target_id)}",
-            f"• Ник: {u['nickname'] or 'не указан'}",
+            f"• Ник: {nick_display}",
             f"• ФИО: {u['rp_name'] or 'не указано'}",
             f"• Должность: {u['position'] or 'не указана'}",
             f"• Фракция: {u['faction'] or 'не указана'}",
@@ -2505,6 +3423,12 @@ class FactionBot:
                 return True
             field = {"edit_nick": "nickname", "edit_rp_name": "rp_name", "edit_position": "position", "edit_faction": "faction"}[state]
             with self.db.conn() as c:
+                _SAFE2 = frozenset({"faction","rp_name","nickname","position","server_id","nick2"})
+                if field not in _SAFE2:
+                    logger.critical(f"SQLi attempt (interactive) field={field!r} actor={ctx.user_id}")
+                    self._alert_senior_admin(f"🚨 SQLi попытка (interactive !изменить): поле={field!r}, id{ctx.user_id}")
+                    self.send(ctx.peer_id, "⛔ Недопустимое поле.")
+                    return
                 c.execute(f"UPDATE users SET {field}=? WHERE vk_id=?", (value, target_id))
                 c.execute(
                     f"INSERT INTO preapproved_profiles(vk_id,approved,{field},updated_at) VALUES(?,1,?,?) "
@@ -2522,8 +3446,351 @@ class FactionBot:
 
     # ---------- main dispatcher ----------
 
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ДЖ / Найм — вспомогательные методы
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _dj_get_positions(self, faction: str, server_id: int) -> list[dict]:
+        """Возвращает список должностей ДЖ (level, name) отсортированных по убыванию уровня."""
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT id, level, name FROM dj_positions WHERE faction=? AND server_id=? ORDER BY level DESC, name COLLATE NOCASE",
+                (faction, int(server_id)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _dj_get_headers(self, faction: str, server_id: int) -> list[dict]:
+        """Возвращает заголовки разделов ДЖ (title, level_min, level_max)."""
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT id, title, level_min, level_max FROM dj_headers WHERE faction=? AND server_id=? ORDER BY level_max DESC",
+                (faction, int(server_id)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _dj_find_position(self, faction: str, server_id: int, query: str) -> Optional[dict]:
+        """Ищет должность по уровню или названию (нечёткое NOCASE)."""
+        query = query.strip()
+        with self.db.conn() as c:
+            if query.lstrip("-").isdigit():
+                row = c.execute(
+                    "SELECT id, level, name FROM dj_positions WHERE faction=? AND server_id=? AND level=? LIMIT 1",
+                    (faction, int(server_id), int(query)),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT id, level, name FROM dj_positions WHERE faction=? AND server_id=? AND LOWER(name)=LOWER(?) LIMIT 1",
+                    (faction, int(server_id), query),
+                ).fetchone()
+        return dict(row) if row else None
+
+    def _dj_format_member(self, uid: int, platform: str = "vk") -> str:
+        """Форматирует строку для сотрудника в списке ДЖ:
+        Ник – [Имя ВК](ссылка) – или (TG) если телеграмм.
+        """
+        # Получаем имя из кэша или через API
+        cached = self.user_name_cache.get(uid)
+        if cached:
+            vk_name = cached[0]
+        else:
+            try:
+                info = self.api.users.get(user_ids=str(uid))[0]
+                vk_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip()
+                self.user_name_cache[uid] = (vk_name, self.now_ts())
+            except Exception:
+                vk_name = f"id{uid}"
+        
+        with self.db.conn() as c:
+            u = c.execute("SELECT nickname, platform FROM users WHERE vk_id=?", (uid,)).fetchone()
+            nick_str = (u["nickname"] if u else None) or ""
+            user_platform = (u["platform"] if u else "vk") or "vk"
+        
+        if user_platform == "tg":
+            return f"{nick_str} – {vk_name} (TG)"
+        else:
+            return f"{nick_str} – [id{uid}|{vk_name}]"
+            
+    def _dj_render(self, faction: str, server_id: int) -> str:
+        """Рендерит красивый список ДЖ с заголовками, счётчиком сотрудников."""
+        positions = self._dj_get_positions(faction, server_id)
+        headers = self._dj_get_headers(faction, server_id)
+
+        # Получаем реальных сотрудников на каждой должности (+ nickname + platform)
+        with self.db.conn() as c:
+            staff_rows = c.execute(
+                "SELECT vk_id, position, nickname, platform FROM users "
+                "WHERE faction=? AND server_id=? AND approved=1 "
+                "AND TRIM(COALESCE(position,''))!='' AND LOWER(COALESCE(position,''))!='не указана'",
+                (faction, int(server_id)),
+            ).fetchall()
+
+        # Группируем сотрудников по должности (case-insensitive): {pos_key: [(uid, nick, platform)]}
+        staff_by_pos: dict[str, list[tuple]] = {}
+        for s in staff_rows:
+            key = str(s["position"] or "").strip().lower()
+            staff_by_pos.setdefault(key, []).append((
+                int(s["vk_id"]),
+                str(s["nickname"] or ""),
+                str(s["platform"] or "vk"),
+            ))
+
+        total_staff = sum(len(v) for v in staff_by_pos.values())
+        total_positions = len(positions)
+
+        lines = [f"📋 СПИСОК ДЖ ФРАКЦИИ {faction.upper()} RW#{server_id}", ""]
+
+        sorted_headers = sorted(headers, key=lambda h: -h["level_max"])
+
+        def _render_header(h: dict) -> str:
+            title = h["title"].upper()
+            interval = f"({h['level_min']}-{h['level_max']})"
+            
+            header_line = f"=== {title} ==="
+            title_len = len(title)
+            interval_len = len(interval)
+            
+            if interval_len >= title_len:
+                pad_left = 2
+            else:
+                pad_left = 2 + (title_len - interval_len) // 2
+            
+            interval_line = " " * pad_left + interval
+            return f"{header_line}\n{interval_line}"
+
+        def _format_staff_line(level: int, pos_name: str, uid: int, nick: str, platform: str) -> str:
+            nick_str = nick.strip() if nick.strip() else "—"
+            
+            if platform == "tg":
+                cached = self.user_name_cache.get(uid)
+                vk_name = cached[0] if cached else None
+                ref = f"{vk_name or ('tg_id_' + str(uid))} (TG)"
+            else:
+                # Используем _fmt_user для красивой ссылки
+                ref = self._fmt_user(uid)
+            
+            return f"{level}) {nick_str} — {ref} — {pos_name}."
+
+        used_positions: set[int] = set()  # <-- ЭТА СТРОКА ДОЛЖНА БЫТЬ ЗДЕСЬ
+
+        for h in sorted_headers:
+            section_positions = [p for p in positions if h["level_min"] <= p["level"] <= h["level_max"] and p["id"] not in used_positions]
+            if not section_positions:
+                continue
+            lines.append(_render_header(h))
+            for p in section_positions:
+                used_positions.add(p["id"])
+                staff = staff_by_pos.get(p["name"].strip().lower(), [])
+                if staff:
+                    for uid, nick, platform in staff:
+                        lines.append(_format_staff_line(p["level"], p["name"], uid, nick, platform))
+                else:
+                    lines.append(f"{p['level']}) (вакансия) — {p['name']}.")
+            lines.append("")
+
+        unassigned = [p for p in positions if p["id"] not in used_positions]
+        if unassigned:
+            lines.append(" === БЕЗ РАЗДЕЛА ===")
+            for p in unassigned:
+                staff = staff_by_pos.get(p["name"].strip().lower(), [])
+                if staff:
+                    for uid, nick, platform in staff:
+                        lines.append(_format_staff_line(p["level"], p["name"], uid, nick, platform))
+                else:
+                    lines.append(f"{p['level']}) (вакансия) — {p['name']}.")
+            lines.append("")
+
+        lines.append(f"📊 Итого: {total_positions} должностей | 👥 {total_staff} сотрудников")
+        return "\n".join(lines)
+
+    def _parse_level_range(self, s: str) -> Optional[tuple[int, int]]:
+        """Парсит строку вида '80-90' или '80 - 90' или '90-80' → (min, max)."""
+        s = s.strip()
+        m = re.match(r"^(\d+)\s*[-–—]\s*(\d+)$", s)
+        if not m:
+            return None
+        a, b = int(m.group(1)), int(m.group(2))
+        return (min(a, b), max(a, b))
+
+    def _kick_from_faction_chats(self, user_id: int, faction: str, server_id: int) -> int:
+        """Кикает пользователя из всех чатов фракции на сервере. Возвращает кол-во чатов."""
+        with self.db.conn() as c:
+            chats = c.execute(
+                "SELECT chat_id FROM chats WHERE faction=? AND server_id=?",
+                (faction, int(server_id)),
+            ).fetchall()
+        kicked = 0
+        for row in chats:
+            try:
+                self.api.messages.removeChatUser(chat_id=int(row["chat_id"]), member_id=user_id)
+                kicked += 1
+            except Exception:
+                pass
+        return kicked
+
+    def _send_hire_offer_buttons(self, target_id: int, offer_id: int, actor_faction: str, pos_name: str) -> bool:
+        """Отправляет предложение о найме целевому пользователю с кнопками."""
+        keyboard = json.dumps({
+            "inline": True,
+            "buttons": [[
+                {"action": {"type": "callback", "label": "✅ Принять", "payload": json.dumps({"cmd": "hire_accept", "id": offer_id})}, "color": "positive"},
+                {"action": {"type": "callback", "label": "❌ Отказать", "payload": json.dumps({"cmd": "hire_reject", "id": offer_id})}, "color": "negative"},
+            ]],
+        })
+        msg = (
+            f"💼 Вам поступило предложение о работе!\n"
+            f"Фракция: {actor_faction}\n"
+            f"Должность: {pos_name}\n\n"
+            "Принять предложение?"
+        )
+        try:
+            self.api.messages.send(peer_id=target_id, random_id=0, message=msg, keyboard=keyboard, disable_mentions=1)
+            return True
+        except Exception as e:
+            logger.error(f"[hire] Ошибка отправки оффера: {e}")
+            return False
+
+    def _send_hire_old_chats_question(self, target_id: int, offer_id: int, old_faction: str, old_server: int) -> None:
+        """После принятия оффера — спрашиваем про выход из старых чатов."""
+        keyboard = json.dumps({
+            "inline": True,
+            "buttons": [[
+                {"action": {"type": "callback", "label": "✅ Да, выйти", "payload": json.dumps({"cmd": "hire_kick_old", "id": offer_id})}, "color": "negative"},
+                {"action": {"type": "callback", "label": "❌ Нет", "payload": json.dumps({"cmd": "hire_keep_old", "id": offer_id})}, "color": "secondary"},
+            ]],
+        })
+        msg = f"Выйти из чатов фракции {old_faction} (сервер {old_server}) — предыдущего места работы?"
+        try:
+            self.api.messages.send(peer_id=target_id, random_id=0, message=msg, keyboard=keyboard, disable_mentions=1)
+        except Exception:
+            pass
+
+    def _send_leader_kick_question(self, leader_id: int, fired_user_id: int, offer_id: int, fired_faction: str, fired_server: int) -> None:
+        """Уведомляем лидера старой фракции об уходе сотрудника."""
+        cached = self.user_name_cache.get(fired_user_id)
+        name = cached[0] if cached else f"id{fired_user_id}"
+        keyboard = json.dumps({
+            "inline": True,
+            "buttons": [[
+                {"action": {"type": "callback", "label": "✅ Кикнуть", "payload": json.dumps({"cmd": "leader_kick_yes", "id": offer_id, "uid": fired_user_id, "srv": fired_server, "fac": fired_faction})}, "color": "negative"},
+                {"action": {"type": "callback", "label": "❌ Нет", "payload": json.dumps({"cmd": "leader_kick_no", "id": offer_id})}, "color": "secondary"},
+            ]],
+        })
+        msg = (
+            f"ℹ️ Сотрудник [id{fired_user_id}|{name}] принял предложение о работе и покидает вашу фракцию {fired_faction} (сервер {fired_server}).\n"
+            "Кикнуть его из всех чатов вашей фракции?"
+        )
+        try:
+            self.api.messages.send(peer_id=leader_id, random_id=0, message=msg, keyboard=keyboard, disable_mentions=1)
+        except Exception:
+            pass
+
+    # ── resign helpers ─────────────────────────────────────────────────────────
+
+    def _send_resign_user_confirm(self, ctx: Ctx, reason: str) -> None:
+        """Отправляет пользователю кнопки подтверждения увольнения."""
+        keyboard = {
+            "inline": True,
+            "buttons": [[
+                {"action": {"type": "callback", "label": "✅ Да, уволиться", "payload": json.dumps({"cmd": "resign_confirm", "uid": ctx.user_id})}, "color": "negative"},
+                {"action": {"type": "callback", "label": "❌ Нет, отмена", "payload": json.dumps({"cmd": "resign_cancel", "uid": ctx.user_id})}, "color": "secondary"},
+            ]],
+        }
+        msg = (
+            f"⚠️ Вы уверены, что хотите уволиться?\n"
+            f"Причина: {reason}\n\n"
+            "После подтверждения запрос уйдёт лидеру вашей фракции."
+        )
+        try:
+            self.api.messages.send(
+                peer_id=ctx.user_id,  # ВСЕГДА в ЛС, не в чат
+                random_id=0,
+                message=msg,
+                keyboard=json.dumps(keyboard),
+                disable_mentions=1,
+            )
+        except Exception as e:
+            logger.error(f"[resign] Ошибка отправки подтверждения: {e}")
+
+    def _send_resign_leader_confirm(self, leader_id: int, user_id: int, reason: str, req_id: int) -> bool:
+        """Отправляет лидеру фракции запрос на подтверждение увольнения."""
+        keyboard = {
+            "inline": True,
+            "buttons": [[
+                {"action": {"type": "callback", "label": "✅ Подтвердить", "payload": json.dumps({"cmd": "resign_leader_yes", "id": req_id})}, "color": "positive"},
+                {"action": {"type": "callback", "label": "❌ Отказать", "payload": json.dumps({"cmd": "resign_leader_no", "id": req_id})}, "color": "negative"},
+            ]],
+        }
+        # Пытаемся получить имя из кэша, иначе форматируем через _fmt_user (без блокировки)
+        cached = self.user_name_cache.get(user_id)
+        user_display = cached[0] if cached else f"id{user_id}"
+        with self.db.conn() as c:
+            u_info = c.execute(
+                "SELECT nickname, faction, server_id FROM users WHERE vk_id=?", (user_id,)
+            ).fetchone()
+        faction_str = u_info["faction"] if u_info else "не указана"
+        server_str = str(int(u_info["server_id"] or 1)) if u_info else "?"
+        nick_str = u_info["nickname"] if u_info and u_info["nickname"] else "не указан"
+        msg = (
+            f"📋 Запрос на увольнение\n"
+            f"Сотрудник: [id{user_id}|{user_display}]\n"
+            f"Ник: {nick_str} | Фракция: {faction_str} | Сервер: {server_str}\n"
+            f"Причина: {reason}\n\n"
+            "Подтвердить увольнение?"
+        )
+        try:
+            self.api.messages.send(
+                peer_id=leader_id,
+                random_id=0,
+                message=msg,
+                keyboard=json.dumps(keyboard),
+                disable_mentions=1,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[resign] Ошибка отправки лидеру: {e}")
+            return False
+
+    def _do_resign(self, user_id: int) -> str:
+        """Выполняет увольнение: сбрасывает фракцию и должность пользователя."""
+        with self.db.conn() as c:
+            u = c.execute("SELECT faction, position, server_id FROM users WHERE vk_id=?", (user_id,)).fetchone()
+            if not u:
+                return "❌ Пользователь не найден."
+            old_faction = u["faction"]
+            old_position = u["position"]
+            c.execute(
+                "UPDATE users SET faction='', position='', admin_level=0 WHERE vk_id=?",
+                (user_id,),
+            )
+            c.execute("DELETE FROM resign_requests WHERE user_id=?", (user_id,))
+        cached = self.user_name_cache.get(user_id)
+        name_str = cached[0] if cached else f"id{user_id}"
+        try:
+            self.send_dm(user_id, "✅ Ваше увольнение подтверждено. Фракция и должность обнулены.")
+        except Exception:
+            pass
+        try:
+            self._add_history(
+                nickname=name_str,
+                target_vk_id=user_id,
+                old_faction=old_faction,
+                old_position=old_position,
+                new_faction=None,
+                new_position=None,
+                actor_vk_id=None,
+                event_type="resign",
+            )
+        except Exception as e:
+            logger.error(f"_add_history error in _do_resign: {e}")
+        return f"✅ Пользователь {name_str} (id{user_id}) уволен."
+
     def handle_command(self, ctx: Ctx) -> None:
-        text = self._normalize_bang_command(ctx.text)
+        # Защита: обрезаем слишком длинный ввод (DoS защита)
+        raw_text = (ctx.text or "")
+        if len(raw_text) > 2000:
+            return  # Игнорируем аномально длинные сообщения без ответа
+        text = self._normalize_bang_command(self._sanitize_input(raw_text, 1000))
         low = text.lower()
         is_senior = self._is_senior_admin_ctx(ctx)
 
@@ -2583,7 +3850,11 @@ class FactionBot:
         if not low.startswith("!"):
             return
 
-        cmd = self._resolve_alias(low.split()[0])
+        # Игнорируем одиночный "!" без команды
+        _first_token = low.split()[0] if low.split() else ""
+        if _first_token == "!":
+            return
+        cmd = self._resolve_alias(_first_token)
         self._current_user_for_parse = ctx.user_id
         if cmd != low.split()[0]:
             tokens = text.split()
@@ -2592,8 +3863,32 @@ class FactionBot:
                 text = " ".join(tokens)
                 low = text.lower()
         pre_parts = text.split()
+        # Многословные команды — разрешение по первым двум токенам
         if cmd == "!удалить" and len(pre_parts) >= 2 and pre_parts[1].lower() == "инфу":
             cmd = "!удалитьинфу"
+        if cmd == "!удалить" and len(pre_parts) >= 2 and pre_parts[1].lower() == "список":
+            cmd = "!удалить список"
+        if cmd == "!новый" and len(pre_parts) >= 2 and pre_parts[1].lower() == "список":
+            cmd = "!новый список"
+        if cmd == "!все" and len(pre_parts) >= 2 and pre_parts[1].lower() == "списки":
+            cmd = "!все списки"
+        if cmd == "!дж" and len(pre_parts) >= 3 and pre_parts[1].lower() == "в" and pre_parts[2].lower() in {"роли", "роль"}:
+            cmd = "!дж"
+            # оставляем parts[1]="в" чтобы субкоманда "в роли" распозналась
+        if cmd == "!проверка" and len(pre_parts) >= 2 and pre_parts[1].lower() in {"команд", "команды"}:
+            cmd = "!проверка команд"
+        if cmd == "!новое" and len(pre_parts) >= 2 and pre_parts[1].lower() == "приветствие":
+            cmd = "!новое приветствие"
+        if cmd == "!список" and len(pre_parts) >= 2 and pre_parts[1].lower() == "доступ":
+            cmd = "!список доступ"
+        if cmd == "!все" and len(pre_parts) >= 2 and pre_parts[1].lower() == "списки":
+            cmd = "!все списки"
+        if cmd == "!удалить" and len(pre_parts) >= 2 and pre_parts[1].lower() == "приветствие":
+            cmd = "!удалить приветствие"
+        if cmd == "!отключить" and len(pre_parts) >= 2 and pre_parts[1].lower() == "чат":
+            cmd = "!отключить чат"
+        if cmd == "!включить" and len(pre_parts) >= 2 and pre_parts[1].lower() == "чат":
+            cmd = "!включить чат"
         self._active_command = (ctx.user_id, text, ctx.peer_id)
         if ctx.is_chat:
             with self.db.conn() as c:
@@ -2605,6 +3900,18 @@ class FactionBot:
             return
 
         bot_closed = self._is_bot_closed()
+        # ── Проверка: чат отключён? ──────────────────────────────────────────
+        # Делаем ДО проверки регистрации — чтобы не слать "вы не зарегистрированы" в отключённом чате
+        if ctx.is_chat:
+            with self.db.conn() as c:
+                _ch = c.execute("SELECT enabled FROM chat_controls WHERE chat_id=?", (ctx.chat_id,)).fetchone()
+            _chat_enabled = True if not _ch else bool(int(_ch["enabled"]))
+            if not is_senior and not _chat_enabled:
+                # В отключённом чате разрешаем только !включить чат (все варианты написания)
+                allow_cmds = {"!включить чат", "!включить", "!включитьчат"}
+                if cmd not in allow_cmds:
+                    return  # молча игнорируем — не пишем ничего, не пишем "не зарегистрирован"
+
         if bot_closed and self._get_admin_level(ctx.user_id) == 0 and not is_senior:
             if not ctx.is_chat:
                 self.send(ctx.peer_id, "⛔ Бот временно закрыт. Доступ только для админов.")
@@ -2665,14 +3972,6 @@ class FactionBot:
             self.send(ctx.peer_id, f"⏳ Подождите {cd_left} сек. перед повтором команды {cmd}.")
             return
 
-        if ctx.is_chat:
-            with self.db.conn() as c:
-                ch = c.execute("SELECT enabled FROM chat_controls WHERE chat_id=?", (ctx.chat_id,)).fetchone()
-            enabled = True if not ch else bool(int(ch["enabled"]))
-            if (not is_senior) and (not enabled) and not (cmd == "!включить" and len(parts) >= 2 and parts[1].lower() == "чат"):
-                self._active_command = None
-                return
-
         self._remember_chat_command(ctx, text)
 
         if cmd == "!я":
@@ -2682,7 +3981,7 @@ class FactionBot:
         if cmd == "!версия":
             self.send(
                 ctx.peer_id,
-                f"🧪 Версия бота: {BOT_VERSION}\n💾 База данных: {self.db.path}",
+                f"🧪 Версия бота: {BOT_VERSION}\n💾 База данных: bot official",
             )
             return
 
@@ -2733,18 +4032,24 @@ class FactionBot:
 
 
         if cmd == "!помощь":
-            self.send(ctx.peer_id, "Список команд: https://vk.com/@pulse_rwpe-principy-raboty")
+            self.send(ctx.peer_id, "Список команд: https://vk.ru/@pulse_rwpe-n-bota")
             return
+            
+        
 
         if cmd in {"!команды", "!комнады"}:
             actor = self._user(ctx.user_id)
             is_admin_faction = bool(actor and actor["faction"] == SECRET_FACTION)
-            if len(parts) > 1 and not is_admin_faction:
-                self.send(ctx.peer_id, "⛔ Указывать уровни роли/админ прав в !команды могут только пользователи фракции Админ.")
-                return
+            actor_admin = self._get_admin_level(ctx.user_id)
+            actor_role = self._get_role_level(ctx.chat_id, ctx.user_id) if ctx.is_chat else 0
+
             role_probe: Optional[int] = None
             admin_probe: Optional[int] = None
+
             if len(parts) >= 2:
+                if not is_admin_faction and not self._is_senior_admin_ctx(ctx):
+                    self.send(ctx.peer_id, "⛔ Указывать уровни роли/админ прав в !команды могут только пользователи фракции Админ.")
+                    return
                 if not parts[1].isdigit():
                     self.send(ctx.peer_id, "Формат: !команды [уровень роли] [уровень админ прав]")
                     return
@@ -2754,32 +4059,121 @@ class FactionBot:
                     self.send(ctx.peer_id, "Формат: !команды [уровень роли] [уровень админ прав]")
                     return
                 admin_probe = int(parts[2])
+
+            eff_role = role_probe if role_probe is not None else actor_role
+            eff_admin = admin_probe if admin_probe is not None else actor_admin
+            chat_id_ctx = ctx.chat_id if ctx.is_chat else None
+
+            # Персональные разрешения/запреты
+            with self.db.conn() as c:
+                allow_rows_k = c.execute(
+                    "SELECT command, granted_by FROM user_cmd_allow WHERE target_vk_id=?", (ctx.user_id,)
+                ).fetchall()
+                deny_rows_k = c.execute(
+                    "SELECT command FROM user_cmd_deny WHERE target_vk_id=?", (ctx.user_id,)
+                ).fetchall()
+            allow_map_k = {r["command"]: r["granted_by"] for r in allow_rows_k}
+            deny_set_k = {r["command"] for r in deny_rows_k}
+
+            # Строим категории по admin_level для красивого отображения
+            CATEGORIES = [
+                (0,   "🟢 Публичные (все)"),
+                (5,   "🔵 Модераторы (admin 5+)"),
+                (10,  "🟡 admin 10+"),
+                (30,  "🟠 admin 30+"),
+                (40,  "🔴 admin 40+"),
+                (50,  "🔴 admin 50+"),
+                (70,  "🟣 admin 70+"),
+                (90,  "⚫ admin 90+"),
+                (100, "💀 Только старший админ (100)"),
+            ]
+
             available: list[str] = []
             for ccmd in sorted(COMMAND_ACCESS.keys()):
                 if ccmd == "!облик" and not self._is_senior_admin_ctx(ctx):
                     continue
-                usage = COMMAND_USAGE.get(ccmd, ccmd)
-                if role_probe is None and admin_probe is None:
-                    fake = Ctx(
-                        user_id=ctx.user_id,
-                        peer_id=ctx.peer_id,
-                        text=ccmd,
-                        reply_user_id=ctx.reply_user_id,
-                        reply_text=ctx.reply_text,
-                        platform=ctx.platform,
-                        tg_is_chat=ctx.tg_is_chat,
-                    )
-                    if self._has_access(fake, ccmd):
-                        available.append(f"• {usage}")
+                cmd_norm_k = self._normalize_command_name(ccmd)
+
+                # Персональный запрет — пропускаем
+                if cmd_norm_k in deny_set_k:
+                    continue
+
+                # Персональное разрешение — показываем с пометкой
+                if cmd_norm_k in allow_map_k:
+                    granter_k = self.user_name_cache.get(allow_map_k[cmd_norm_k])
+                    gname = granter_k[0] if granter_k else f"id{allow_map_k[cmd_norm_k]}"
+                    available.append(f"• {ccmd}  ✅ разрешено: {gname}")
+                    continue
+
+                # Вычисляем требования
+                eff_min_admin = self._get_effective_admin_min(ccmd)
+                need_role = self._required_role(ccmd, chat_id_ctx)
+                has_custom_role = ctx.is_chat and self._has_custom_role_right(ctx.chat_id, ccmd)
+
+                # Проверяем доступность по тем же правилам что _has_access
+                accessible = False
+                tag = ""
+                if eff_min_admin > 0:
+                    if eff_admin >= eff_min_admin:
+                        accessible = True
+                        tag = f"[адм.{eff_min_admin}+]"
+                    elif has_custom_role and eff_role >= need_role:
+                        accessible = True
+                        tag = f"[роль {need_role}+ кастом]"
                 else:
-                    probe_role = role_probe if role_probe is not None else self._get_role_level(ctx.chat_id, ctx.user_id)
-                    probe_admin = admin_probe if admin_probe is not None else self._get_admin_level(ctx.user_id)
-                    need_role = self._required_role(ccmd, ctx.chat_id if ctx.is_chat else None)
-                    need_admin = self._get_admin_min(ccmd)
-                    include = (probe_admin >= need_admin) or (probe_role >= need_role)
-                    if include:
-                        available.append(f"• {usage}")
-            self.send(ctx.peer_id, "📘 Доступные команды:\n" + ("\n".join(sorted(set(available), key=lambda x: x.lower())) if available else "нет доступных команд"))
+                    if need_role == 0:
+                        accessible = True
+                        tag = ""
+                    elif eff_role >= need_role:
+                        accessible = True
+                        tag = f"[роль {need_role}+]"
+
+                if accessible:
+                    line = f"• {ccmd}"
+                    if tag:
+                        line += f"  {tag}"
+                    available.append(line)
+
+            if not available:
+                self.send(ctx.peer_id, "📘 Нет доступных команд.")
+                return
+
+            unique_lines = sorted(set(available), key=lambda x: x.lower())
+            header = "📘 Команды бота"
+            if role_probe is not None or admin_probe is not None:
+                header += f" (просмотр для: роль={eff_role}, адм.={eff_admin})"
+            header += f"\nВаш уровень: роль={actor_role}, адм.={actor_admin}"
+
+            # Разбиваем на части по 3800 символов и отправляем в ЛС
+            # В чате сообщаем что команды отправлены в ЛС
+            VK_LIMIT = 3800
+            chunks: list[str] = []
+            current = header
+            is_first = True
+            for line in unique_lines:
+                candidate = (current + "\n" + line) if not is_first else (current + "\n\n" + line)
+                if len(candidate) > VK_LIMIT:
+                    chunks.append(current)
+                    current = "📘 Команды (продолжение):\n" + line
+                    is_first = False
+                else:
+                    current = candidate
+                    is_first = False
+            chunks.append(current)
+
+            # Если всё влезает в одно сообщение — отвечаем прямо в чат/ЛС
+            CHAT_LIMIT = 3500
+            if len(chunks) == 1 and len(chunks[0]) <= CHAT_LIMIT:
+                self.send(ctx.peer_id, chunks[0])
+            else:
+                # Не влезает — шлём в ЛС
+                if ctx.is_chat:
+                    self.send(ctx.peer_id, f"📘 Список из {len(unique_lines)} команд отправлен вам в личные сообщения.")
+                for chunk in chunks:
+                    try:
+                        self.send_dm(ctx.user_id, chunk)
+                    except Exception:
+                        self.send(ctx.peer_id, chunk)
             return
 
         if cmd == "!логи" and ctx.is_chat:
@@ -2795,53 +4189,427 @@ class FactionBot:
             self.send(ctx.peer_id, "\n".join(lines))
             return
 
-        if cmd == "!дж":
+        if cmd in {"!дж", "!должности"}:
             actor = self._user(ctx.user_id)
             actor_faction = actor["faction"] if actor else None
             actor_server = int(actor["server_id"] or 1) if actor else 1
-            can_view_hidden = actor_faction == SECRET_FACTION
+            actor_admin = self._get_admin_level(ctx.user_id)
+            is_admin_faction = actor_faction == SECRET_FACTION or actor_admin >= 90
+
+            # Защита: !дж доступна только в чате своей фракции (или в ЛС)
+            # Не применяется к фракции Админ и admin 90+
+            if ctx.is_chat and not is_admin_faction:
+                with self.db.conn() as c:
+                    chat_row = c.execute(
+                        "SELECT faction FROM chats WHERE chat_id=?", (ctx.chat_id,)
+                    ).fetchone()
+                chat_faction = str(chat_row["faction"] or "").strip() if chat_row else ""
+                # Если чат не привязан к фракции или привязан к другой фракции — блокируем
+                if not chat_faction or chat_faction.lower() != (actor_faction or "").lower():
+                    self.send(ctx.peer_id, "⛔ Вам команда доступна только в чате своей фракции.")
+                    return
+
+            # ── субкоманда: !дж заголовок ───────────────────────────────────
+            if len(parts) >= 2 and parts[1].lower() == "заголовок":
+                # Права: лидер своей фракции или admin 70+
+                if not self._is_leader_user(ctx.user_id) and actor_admin < 70:
+                    self.send(ctx.peer_id, "⛔ Только лидер фракции или admin 70+ может управлять заголовками.")
+                    return
+
+                # !дж заголовок удалить (название)
+                if len(parts) >= 3 and parts[2].lower() == "удалить":
+                    title_del = " ".join(parts[3:]).strip()
+                    if not title_del:
+                        self.send(ctx.peer_id, "Формат: !дж заголовок удалить (название)")
+                        return
+                    with self.db.conn() as c:
+                        cur = c.execute(
+                            "DELETE FROM dj_headers WHERE faction=? AND server_id=? AND LOWER(title)=LOWER(?)",
+                            (actor_faction, actor_server, title_del),
+                        )
+                    if cur.rowcount:
+                        self.send(ctx.peer_id, f"✅ Заголовок «{title_del.upper()}» удалён.")
+                    else:
+                        self.send(ctx.peer_id, f"❌ Заголовок «{title_del}» не найден.")
+                    return
+
+                # !дж заголовок (название) (интервал)  — интервал последний аргумент вида NN-NN
+                # Интервал может быть "80-90", "80 - 90", "80- 90" и т.д.
+                if len(parts) < 4:
+                    self.send(ctx.peer_id, "Формат: !дж заголовок (название) (мин-макс)\nПример: !дж заголовок Руководство 80-90")
+                    return
+                # Парсим интервал — пробуем взять последний или последние два токена
+                range_parsed = None
+                range_end_idx = len(parts)
+                # Пробуем последний один токен как диапазон
+                range_parsed = self._parse_level_range(parts[-1])
+                if range_parsed:
+                    title_parts = parts[2:-1]
+                else:
+                    # Пробуем последние три токена "NN - NN"
+                    if len(parts) >= 5:
+                        range_try = " ".join(parts[-3:])
+                        range_parsed = self._parse_level_range(range_try)
+                        if range_parsed:
+                            title_parts = parts[2:-3]
+                if not range_parsed or not title_parts:
+                    self.send(ctx.peer_id, "❌ Не удалось распознать интервал. Пример: !дж заголовок Руководство 80-90")
+                    return
+                title = " ".join(title_parts).strip().upper()
+                lmin, lmax = range_parsed
+                with self.db.conn() as c:
+                    c.execute(
+                        "INSERT OR REPLACE INTO dj_headers(faction,server_id,title,level_min,level_max) VALUES(?,?,?,?,?)",
+                        (actor_faction, actor_server, title, lmin, lmax),
+                    )
+                self.send(ctx.peer_id, f"✅ Заголовок «{title}» ({lmin}–{lmax}) добавлен/обновлён.")
+                return
+
+            # ── субкоманда: !дж новая ───────────────────────────────────────
+            if len(parts) >= 2 and parts[1].lower() == "новая":
+                if not self._is_leader_user(ctx.user_id) and actor_admin < 70:
+                    self.send(ctx.peer_id, "⛔ Только лидер фракции или admin 70+ может добавлять должности.")
+                    return
+                # Последний токен — уровень
+                if len(parts) < 4 or not parts[-1].lstrip("-").isdigit():
+                    self.send(ctx.peer_id, "Формат: !дж новая (название должности) (уровень)\nПример: !дж новая Руководитель отдела 60")
+                    return
+                level = int(parts[-1])
+                pos_name = " ".join(parts[2:-1]).strip()
+                if not pos_name:
+                    self.send(ctx.peer_id, "❌ Укажите название должности.")
+                    return
+                try:
+                    with self.db.conn() as c:
+                        c.execute(
+                            "INSERT INTO dj_positions(faction,server_id,level,name) VALUES(?,?,?,?)",
+                            (actor_faction, actor_server, level, pos_name),
+                        )
+                    self.send(ctx.peer_id, f"✅ Должность «{pos_name}» (уровень {level}) добавлена в ДЖ.")
+                except Exception:
+                    self.send(ctx.peer_id, f"⚠️ Должность «{level}» уже существует в ДЖ.")
+                return
+
+            # ── субкоманда: !дж переименовать ───────────────────────────────
+            if len(parts) >= 2 and parts[1].lower() == "переименовать":
+                if not self._is_leader_user(ctx.user_id) and actor_admin < 70:
+                    self.send(ctx.peer_id, "⛔ Только лидер фракции или admin 70+ может переименовывать должности.")
+                    return
+                if len(parts) < 4:
+                    self.send(ctx.peer_id, "Формат: !дж переименовать (уровень или название) (новое название)")
+                    return
+                # Ищем позицию — всё кроме последнего токена (если не число, то последние два слова = новое название?)
+                # Формат: !дж переименовать <query...> <новое_название...>
+                # query = первый токен (уровень числом) или всё до последнего пробела
+                # Если parts[2] — число, то query=parts[2], new_name=parts[3:]
+                # Если нет — parts[2] — первое слово query, parts[-1] — последнее слово нового имени (неоднозначно)
+                # Упрощаем: query = parts[2], new_name = parts[3:]
+                query = parts[2]
+                new_name = " ".join(parts[3:]).strip()
+                if not new_name:
+                    self.send(ctx.peer_id, "❌ Укажите новое название.")
+                    return
+                found = self._dj_find_position(actor_faction, actor_server, query)
+                if not found:
+                    self.send(ctx.peer_id, f"❌ Должность «{query}» не найдена в ДЖ.")
+                    return
+                old_name = found["name"]
+                try:
+                    with self.db.conn() as c:
+                        c.execute("UPDATE dj_positions SET name=? WHERE id=?", (new_name, found["id"]))
+                        # Обновляем должность у всех сотрудников с этой должностью
+                        updated = c.execute(
+                            "UPDATE users SET position=? WHERE LOWER(position)=LOWER(?) AND faction=? AND server_id=?",
+                            (new_name, old_name, actor_faction, actor_server),
+                        ).rowcount
+                    if updated:
+                        self.send(ctx.peer_id, f"✅ Должность «{old_name}» переименована в «{new_name}». Обновлено сотрудников: {updated}.")
+                    else:
+                        self.send(ctx.peer_id, f"✅ Должность «{old_name}» переименована в «{new_name}».")
+                except Exception:
+                    self.send(ctx.peer_id, "❌ Должность с таким названием уже существует.")
+                return
+
+            # субкоманда !дж в роли убрана — теперь отдельная команда !синхроль
+            if len(parts) >= 2 and parts[1].lower() in {"в", "в роли", "вроли"}:
+                self.send(ctx.peer_id, "ℹ️ Используйте команду !синхроль для синхронизации ролей с ДЖ.")
+                return
+
+            # ── субкоманда: !дж удалить ─────────────────────────────────────
+            if len(parts) >= 2 and parts[1].lower() == "удалить":
+                if not self._is_leader_user(ctx.user_id) and actor_admin < 70:
+                    self.send(ctx.peer_id, "⛔ Только лидер фракции или admin 70+ может удалять должности.")
+                    return
+                if len(parts) < 3:
+                    self.send(ctx.peer_id, "Формат: !дж удалить (уровень или название)")
+                    return
+                query = " ".join(parts[2:]).strip()
+                found = self._dj_find_position(actor_faction, actor_server, query)
+                if not found:
+                    self.send(ctx.peer_id, f"❌ Должность «{query}» не найдена в ДЖ.")
+                    return
+                with self.db.conn() as c:
+                    c.execute("DELETE FROM dj_positions WHERE id=?", (found["id"],))
+                self.send(ctx.peer_id, f"✅ Должность «{found['name']}» (уровень {found['level']}) удалена.")
+                return
+
+            # ── Просмотр ДЖ ─────────────────────────────────────────────────
             target_faction = actor_faction
             target_server = actor_server
-            if actor_faction == SECRET_FACTION:
-                if len(parts) < 2:
-                    self.send(ctx.peer_id, "Формат для админов: !дж (фракция) [сервер 1..3]")
-                    return
+            if is_admin_faction and len(parts) >= 2:
                 rest_parts = parts[1:]
                 if rest_parts[-1] in {"1", "2", "3"}:
                     target_server = int(rest_parts[-1])
                     rest_parts = rest_parts[:-1]
-                target_faction, _ = self._extract_faction_and_rest(["!дж"] + rest_parts, 1)
-                if not target_faction:
-                    self.send(ctx.peer_id, "❌ Не удалось распознать фракцию.")
+                if rest_parts:
+                    target_faction, _ = self._extract_faction_and_rest(["!дж"] + rest_parts, 1)
+            if not target_faction:
+                self.send(ctx.peer_id, "❌ У вас не указана фракция. Укажите фракцию: !дж (фракция) [сервер]")
+                return
+            positions = self._dj_get_positions(target_faction, target_server)
+            if not positions:
+                self.send(ctx.peer_id, f"📋 ДЖ фракции {target_faction} (сервер {target_server}): список пуст.\n"
+                          "Добавьте должности: !дж новая (название) (уровень)")
+                return
+            rendered = self._dj_render(target_faction, target_server)
+            self.send(ctx.peer_id, rendered)
+            return
+
+        if cmd == "!сотрудники":
+            actor = self._user(ctx.user_id)
+            actor_faction = actor["faction"] if actor else None
+            actor_server = int(actor["server_id"] or 1) if actor else 1
+            actor_admin = self._get_admin_level(ctx.user_id)
+            is_admin_faction = actor_faction == SECRET_FACTION or actor_admin >= 90
+
+            # Защита: только в чате своей фракции (или ЛС)
+            if ctx.is_chat and not is_admin_faction:
+                with self.db.conn() as c:
+                    chat_row = c.execute("SELECT faction FROM chats WHERE chat_id=?", (ctx.chat_id,)).fetchone()
+                chat_faction = str(chat_row["faction"] or "").strip() if chat_row else ""
+                if not chat_faction or chat_faction.lower() != (actor_faction or "").lower():
+                    self.send(ctx.peer_id, "⛔ Вам команда доступна только в чате своей фракции.")
                     return
+
+            # Определяем фракцию и сервер
+            target_faction = actor_faction
+            target_server = actor_server
+            if is_admin_faction and len(parts) >= 2:
+                rest = parts[1:]
+                if rest[-1] in {"1", "2", "3"}:
+                    target_server = int(rest[-1])
+                    rest = rest[:-1]
+                if rest:
+                    target_faction, _ = self._extract_faction_and_rest(["!сотрудники"] + rest, 1)
+
             if not target_faction:
                 self.send(ctx.peer_id, "❌ У вас не указана фракция.")
                 return
+
             with self.db.conn() as c:
                 rows = c.execute(
-                    """
-                    SELECT u.vk_id,u.position,u.hidden,COALESCE(u.approved_at,p.updated_at,0) AS approved_at, u.approved_by
-                    FROM users u
-                    LEFT JOIN preapproved_profiles p ON p.vk_id=u.vk_id
-                    WHERE u.faction=? AND u.server_id=? AND u.approved=1 AND u.position IS NOT NULL AND TRIM(u.position)!='' AND LOWER(u.position)!='не указана'
-                    ORDER BY u.position COLLATE NOCASE, u.vk_id
-                    """,
-                    (target_faction, target_server),
+                    "SELECT vk_id, nickname, position, platform FROM users "
+                    "WHERE faction=? AND server_id=? AND approved=1 "
+                    "AND TRIM(COALESCE(position,''))!='' AND LOWER(COALESCE(position,''))!='не указана' "
+                    "ORDER BY position COLLATE NOCASE, nickname COLLATE NOCASE",
+                    (target_faction, int(target_server)),
                 ).fetchall()
-                leader = c.execute("SELECT vk_id FROM leaders WHERE faction=? AND server_id=?", (target_faction, target_server)).fetchone()
+
             if not rows:
-                self.send(ctx.peer_id, f"📋 Должности фракции {target_faction} (сервер {target_server}): пусто")
+                self.send(ctx.peer_id, f"👥 В фракции {target_faction} (сервер {target_server}) нет сотрудников.")
                 return
-            out = [f"📋 ДЖ фракции {target_faction} (сервер {target_server}):"]
+
+            lines = [f"👥 СОТРУДНИКИ ФРАКЦИИ {target_faction.upper()} RW#{target_server}", ""]
             for r in rows:
-                ts = int(r["approved_at"] or 0)
-                dt = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M") if ts > 0 else "неизвестно"
-                approver = self._fmt_user(int(r["approved_by"])) if r["approved_by"] else (self._fmt_user(int(leader["vk_id"])) if leader else "неизвестно")
-                if int(r["hidden"] or 0) == 1 and not can_view_hidden:
-                    out.append(f"• {r['position']} — (скрыто) — {dt} — принял: {approver}")
+                uid = int(r["vk_id"])
+                nick = str(r["nickname"] or "").strip() or "—"
+                pos = str(r["position"] or "").strip()
+                platform = str(r["platform"] or "vk")
+                cached = self.user_name_cache.get(uid)
+                vk_name = cached[0] if cached else None
+                if platform == "tg":
+                    ref = f"{vk_name or ('id' + str(uid))} (TG)"
                 else:
-                    out.append(f"• {r['position']} — {self._fmt_user(int(r['vk_id']))} — {dt} — принял: {approver}")
-            self.send(ctx.peer_id, "\n".join(out))
+                    ref = f"[id{uid}|{vk_name or ('id' + str(uid))}]"
+                lines.append(f"• {ref} — {pos}")
+            lines.append(f"\n📊 Итого: {len(rows)} сотрудников")
+            self.send(ctx.peer_id, "\n".join(lines))
+            return
+
+        if cmd == "!приветствие":
+            # Показать текущее приветствие чата
+            if not ctx.is_chat:
+                self.send(ctx.peer_id, "❌ Команда доступна только в чате.")
+                return
+            with self.db.conn() as c:
+                row = c.execute("SELECT text, attachment, sticker_id FROM chat_greetings WHERE chat_id=?", (ctx.chat_id,)).fetchone()
+            if not row or (not str(row["text"]).strip() and not str(row["attachment"] or "").strip() and not row["sticker_id"]):
+                self.send(ctx.peer_id, "ℹ️ Приветствие для этого чата не установлено.\nЧтобы установить, ответьте на сообщение: !новое приветствие")
+                return
+            # Воспроизводим приветствие
+            kwargs = {"peer_id": ctx.peer_id, "random_id": 0, "disable_mentions": 1}
+            if str(row["text"]).strip():
+                kwargs["message"] = str(row["text"])
+            else:
+                kwargs["message"] = "👋 Приветствие чата:"
+            if str(row["attachment"] or "").strip():
+                kwargs["attachment"] = str(row["attachment"])
+            if row["sticker_id"]:
+                kwargs["sticker_id"] = int(row["sticker_id"])
+                kwargs.pop("message", None)
+                kwargs.pop("attachment", None)
+            try:
+                self.api.messages.send(**kwargs)
+            except Exception:
+                self.send(ctx.peer_id, str(row["text"] or "(без текста)"))
+            return
+
+        if cmd == "!новое приветствие":
+            if not ctx.is_chat:
+                self.send(ctx.peer_id, "❌ Команда доступна только в чате.")
+                return
+            if self._get_admin_level(ctx.user_id) < 40 and not self._is_senior_admin_ctx(ctx) and not self._is_leader_user(ctx.user_id):
+                self.send(ctx.peer_id, "⛔ Для установки приветствия нужен admin 40+ или лидер фракции.")
+                return
+            if not ctx.reply_text and not ctx.reply_user_id:
+                self.send(ctx.peer_id, "❌ Используйте команду ОТВЕТОМ на сообщение, которое станет приветствием.")
+                return
+            # Извлекаем текст и вложения из reply
+            greet_text = ctx.reply_text or ""
+            # Вложения из reply мы не можем получить напрямую через ctx — используем peer_id для пересылки
+            # Сохраняем что есть
+            now = self.now_ts()
+            with self.db.conn() as c:
+                c.execute(
+                    "INSERT OR REPLACE INTO chat_greetings(chat_id, text, attachment, created_by, updated_at) VALUES(?,?,?,?,?)",
+                    (ctx.chat_id, greet_text.strip(), "", ctx.user_id, now),
+                )
+            self.send(ctx.peer_id, f"✅ Приветствие установлено.\nПросмотр: !приветствие")
+            return
+
+        if cmd == "!удалить приветствие":
+            if not ctx.is_chat:
+                self.send(ctx.peer_id, "❌ Команда доступна только в чате.")
+                return
+            if self._get_admin_level(ctx.user_id) < 40 and not self._is_senior_admin_ctx(ctx) and not self._is_leader_user(ctx.user_id):
+                self.send(ctx.peer_id, "⛔ Для удаления приветствия нужен admin 40+ или лидер фракции.")
+                return
+            with self.db.conn() as c:
+                cur = c.execute("DELETE FROM chat_greetings WHERE chat_id=?", (ctx.chat_id,))
+            if cur.rowcount:
+                self.send(ctx.peer_id, "✅ Приветствие удалено.")
+            else:
+                self.send(ctx.peer_id, "ℹ️ Приветствие не было установлено.")
+            return
+
+        if cmd in {"!приглос", "!приглашение", "!пригласить"} and ctx.is_chat:
+            if not self._has_access(ctx, "!приглос"):
+                self.send(ctx.peer_id, "⛔ Недостаточно прав для настройки приглашений.")
+                return
+            if len(parts) < 2:
+                # Показать текущий уровень
+                with self.db.conn() as c:
+                    row = c.execute("SELECT min_role, min_admin FROM chat_invite_level WHERE chat_id=?", (ctx.chat_id,)).fetchone()
+                min_role = int(row["min_role"]) if row else 40
+                min_adm = int(row["min_admin"]) if row else 0
+                self.send(ctx.peer_id,
+                    f"👥 Настройка приглашений в этот чат:\n"
+                    f"• Минимальная роль: {min_role}\n"
+                    f"• Минимальный admin: {min_adm}\n"
+                    f"Изменить: !приглос (уровень роли) [admin уровень]")
+                return
+            if not parts[1].isdigit():
+                self.send(ctx.peer_id, "❌ Укажите числовой уровень роли.\nФормат: !приглос (уровень роли) [admin уровень]")
+                return
+            min_role = int(parts[1])
+            min_adm = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
+            if not (0 <= min_role <= 100):
+                self.send(ctx.peer_id, "❌ Уровень роли должен быть от 0 до 100.")
+                return
+            with self.db.conn() as c:
+                c.execute(
+                    "INSERT OR REPLACE INTO chat_invite_level(chat_id, min_role, min_admin) VALUES(?,?,?)",
+                    (ctx.chat_id, min_role, min_adm),
+                )
+            self.send(ctx.peer_id,
+                f"✅ Установлено: минимальная роль {min_role} для приглашения в чат.\n"
+                f"Пользователи с ролью < {min_role} (и admin < {min_adm}) будут кикнуты при попытке добавить кого-то."
+            )
+            return
+
+        if cmd == "!синхроль":
+            if not ctx.is_chat:
+                self.send(ctx.peer_id, "❌ Команда доступна только в чате.")
+                return
+            
+            actor = self._user(ctx.user_id)
+            actor_faction = actor["faction"] if actor else None
+            actor_server = int(actor["server_id"] or 1) if actor else 1
+            actor_admin = self._get_admin_level(ctx.user_id)
+            
+            if not self._is_leader_user(ctx.user_id) and actor_admin < 70:
+                self.send(ctx.peer_id, "⛔ Только лидер фракции или admin 70+ может применять !синхроль.")
+                return
+            
+            positions = self._dj_get_positions(actor_faction, actor_server)
+            if not positions:
+                self.send(ctx.peer_id, "❌ ДЖ список пуст. Добавьте должности через !дж новая.")
+                return
+            
+            # Получаем сотрудников с их должностями
+            with self.db.conn() as c:
+                staff_rows = c.execute(
+                    "SELECT vk_id, position FROM users WHERE faction=? AND server_id=? AND approved=1",
+                    (actor_faction, actor_server),
+                ).fetchall()
+            
+            # Группируем сотрудников по должности
+            staff_by_pos = {}
+            for s in staff_rows:
+                pos_key = str(s["position"] or "").strip().lower()
+                if pos_key:
+                    staff_by_pos.setdefault(pos_key, []).append(int(s["vk_id"]))
+            
+            # Сначала сбрасываем все текущие роли в БД
+            with self.db.conn() as c:
+                c.execute("UPDATE chat_members SET role_level=0 WHERE chat_id=?", (ctx.chat_id,))
+            
+            # Создаём карту уровень -> название роли
+            level_to_name = {p["level"]: p["name"] for p in positions}
+            
+            applied = 0
+            for p in positions:
+                pos_key = p["name"].strip().lower()
+                members = staff_by_pos.get(pos_key, [])
+                
+                # Создаём/обновляем роль в БД чата
+                with self.db.conn() as c:
+                    c.execute(
+                        "INSERT OR REPLACE INTO chat_roles(chat_id, level, name) VALUES(?,?,?)",
+                        (ctx.chat_id, p["level"], p["name"]),
+                    )
+                
+                # Назначаем сотрудников на эту роль
+                for uid in members:
+                    with self.db.conn() as c:
+                        c.execute(
+                            "UPDATE chat_members SET role_level=? WHERE chat_id=? AND vk_id=?",
+                            (p["level"], ctx.chat_id, uid),
+                        )
+                    applied += 1
+            
+            result_msg = f"✅ Синхронизация ДЖ с чатом выполнена!\n"
+            result_msg += f"• Обновлено в БД: {applied} сотрудников\n"
+            result_msg += f"• Ролей в ДЖ: {len(positions)}\n"
+            
+            # Показываем назначенные роли
+            role_lines = []
+            for level in sorted(level_to_name.keys(), reverse=True)[:10]:
+                role_lines.append(f"  {level} → {level_to_name[level]}")
+            if role_lines:
+                result_msg += f"\n📋 Роли в чате:\n" + "\n".join(role_lines)
+            
+            self.send(ctx.peer_id, result_msg)
             return
 
         if cmd == "!логчат" and ctx.is_chat:
@@ -2892,22 +4660,211 @@ class FactionBot:
             self.send(ctx.peer_id, "✅ Логирование команд выключено.")
             return
 
-        if cmd == "!тишина" and ctx.is_chat and len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
-            window_min = max(1, int(parts[1]))
-            msg_limit = max(1, int(parts[2]))
-            with self.db.conn() as c:
-                c.execute(
-                    "INSERT OR REPLACE INTO chat_silence(chat_id,window_min,msg_limit,enabled) VALUES(?,?,?,1)",
-                    (ctx.chat_id, window_min, msg_limit),
+        if cmd == "!тишина" and ctx.is_chat:
+            # Форматы:
+            # !тишина - показать текущие настройки
+            # !тишина <минуты> <сообщений> - установить/обновить
+            # !тишина иммунитет [+|-] [пользователь] - управление исключениями
+            # !тишина админпорог <уровень> - установить админ-уровень для иммунитета
+
+            # Получаем минимальный admin_level для этой команды из настроек
+            required_admin = self._get_admin_min("!тишина")  # по умолчанию 50 из COMMAND_ACCESS
+
+            if len(parts) >= 2 and parts[1].lower() == "иммунитет":
+                # Управление исключениями
+                if self._get_admin_level(ctx.user_id) < required_admin and not self._is_senior_admin_ctx(ctx):
+                    self.send(ctx.peer_id, f"⛔ Для управления исключениями нужен админ-уровень {required_admin}+.")
+                    return
+                
+                if len(parts) >= 3 and parts[2] == "+":
+                    target = (self._parse_user(parts[3]) if len(parts) > 3 else None) or ctx.reply_user_id
+                    if target is None:
+                        self.send(ctx.peer_id, "Формат: !тишина иммунитет + (пользователь) [время_в_минутах]")
+                        return
+                    
+                    duration_min = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 60
+                    until_ts = self.now_ts() + (duration_min * 60)
+                    
+                    with self.db.conn() as c:
+                        c.execute(
+                            "INSERT OR REPLACE INTO silence_exceptions(chat_id,vk_id,until_ts) VALUES(?,?,?)",
+                            (ctx.chat_id, target, until_ts),
+                        )
+                    self.send(ctx.peer_id, f"✅ Пользователь {self._fmt_user(target)} добавлен в исключения тишины на {duration_min} мин.")
+                    return
+                
+                elif len(parts) >= 3 and parts[2] == "-":
+                    target = (self._parse_user(parts[3]) if len(parts) > 3 else None) or ctx.reply_user_id
+                    if target is None:
+                        self.send(ctx.peer_id, "Формат: !тишина иммунитет - (пользователь)")
+                        return
+                    
+                    with self.db.conn() as c:
+                        c.execute("DELETE FROM silence_exceptions WHERE chat_id=? AND vk_id=?", (ctx.chat_id, target))
+                    self.send(ctx.peer_id, f"✅ Пользователь {self._fmt_user(target)} удалён из исключений тишины.")
+                    return
+                
+                else:
+                    # Показать список исключений
+                    with self.db.conn() as c:
+                        rows = c.execute(
+                            "SELECT vk_id, until_ts FROM silence_exceptions WHERE chat_id=? AND until_ts > ? ORDER BY until_ts",
+                            (ctx.chat_id, self.now_ts()),
+                        ).fetchall()
+                    if not rows:
+                        self.send(ctx.peer_id, "📋 Список исключений тишины пуст.")
+                        return
+                    out = ["📋 Исключения тишины в этом чате:"]
+                    for r in rows:
+                        until = datetime.fromtimestamp(int(r["until_ts"]), tz=MSK_TZ).strftime("%d.%m.%Y %H:%M")
+                        out.append(f"• {self._fmt_user(int(r['vk_id']))} — до {until}")
+                    self.send(ctx.peer_id, "\n".join(out))
+                    return
+            
+            elif len(parts) >= 2 and parts[1].lower() == "админпорог" and len(parts) >= 3 and parts[2].isdigit():
+                # Установка админ-уровня для иммунитета (глобальная настройка)
+                if self._get_admin_level(ctx.user_id) < 100:
+                    self.send(ctx.peer_id, "⛔ Только старший админ может менять порог.")
+                    return
+                
+                threshold = int(parts[2])
+                if threshold < 0 or threshold > 100:
+                    self.send(ctx.peer_id, "❌ Уровень должен быть от 0 до 100.")
+                    return
+                
+                with self.db.conn() as c:
+                    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('silence_admin_threshold',?)", (str(threshold),))
+                self.send(ctx.peer_id, f"✅ Админ-уровень для иммунитета к тишине установлен: {threshold}+")
+                return
+            
+            elif len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                # Установка режима тишины
+                if self._get_admin_level(ctx.user_id) < required_admin and not self._is_senior_admin_ctx(ctx):
+                    self.send(ctx.peer_id, f"⛔ Для включения тишины нужен админ-уровень {required_admin}+.")
+                    return
+                
+                window_min = max(1, int(parts[1]))
+                msg_limit = max(1, int(parts[2]))
+                
+                with self.db.conn() as c:
+                    c.execute(
+                        "INSERT OR REPLACE INTO chat_silence(chat_id,window_min,msg_limit,enabled) VALUES(?,?,?,1)",
+                        (ctx.chat_id, window_min, msg_limit),
+                    )
+                
+                # Информация об иммунитете
+                admin_threshold = int(self._get_setting("silence_admin_threshold", "40"))
+                immune_info = f"\n👑 Иммунитет имеют: фракция Админ, лидеры фракций, админы {admin_threshold}+"
+                
+                self.send(ctx.peer_id, 
+                    f"✅ Режим тишины включен: {msg_limit} сообщ. раз в {window_min} мин. на пользователя."
+                    f"{immune_info}"
                 )
-            self.send(ctx.peer_id, f"✅ Режим тишины включен: {msg_limit} сообщ. раз в {window_min} мин. на пользователя.")
-            return
+                return
+            
+            elif len(parts) == 1:
+                # Показать текущие настройки
+                with self.db.conn() as c:
+                    rule = c.execute(
+                        "SELECT window_min,msg_limit,enabled FROM chat_silence WHERE chat_id=?",
+                        (ctx.chat_id,),
+                    ).fetchone()
+                
+                if not rule or int(rule["enabled"] or 0) == 0:
+                    self.send(ctx.peer_id, "ℹ️ Режим тишины в этом чате выключен.")
+                    return
+                
+                admin_threshold = int(self._get_setting("silence_admin_threshold", "40"))
+                self.send(ctx.peer_id, 
+                    f"📊 Настройки тишины в этом чате:\n"
+                    f"• {int(rule['msg_limit'])} сообщ. раз в {int(rule['window_min'])} мин.\n"
+                    f"• Статус: {'Включен' if int(rule['enabled']) else 'Выключен'}\n"
+                    f"• Иммунитет: фракция Админ, лидеры фракций, админы {admin_threshold}+"
+                )
+                return
+            
+            else:
+                self.send(ctx.peer_id, 
+                    "📖 Форматы команды !тишина:\n"
+                    "• !тишина <минуты> <сообщений> — включить\n"
+                    "• !тишина — показать настройки\n"
+                    "• !тишина иммунитет [+|-] [пользователь] — управление исключениями\n"
+                    "• !тишина админпорог <уровень> — установить админ-уровень для иммунитета"
+                )
+                return
 
         if cmd == "!снятьтишину" and ctx.is_chat:
+            required_silence_admin = self._get_admin_min("!снятьтишину")
+            if self._get_admin_level(ctx.user_id) < required_silence_admin and not self._is_senior_admin_ctx(ctx):
+                self.send(ctx.peer_id, f"⛔ Для отключения тишины нужен админ-уровень {required_silence_admin}+.")
+                return
+            
             with self.db.conn() as c:
                 c.execute("DELETE FROM chat_silence WHERE chat_id=?", (ctx.chat_id,))
-                c.execute("DELETE FROM silence_exceptions WHERE chat_id=?", (ctx.chat_id,))
-            self.send(ctx.peer_id, "✅ Режим тишины снят в этом чате.")
+                # Очищаем только просроченные исключения, активные оставляем
+                c.execute("DELETE FROM silence_exceptions WHERE chat_id=? AND until_ts<=?", (ctx.chat_id, self.now_ts()))
+            
+            self.send(ctx.peer_id, "✅ Режим тишины выключен в этом чате. Активные исключения сохранены.")
+            return
+
+        if cmd == "!неприниматьдж":
+            with self.db.conn() as c:
+                exists = c.execute("SELECT 1 FROM hire_opt_out WHERE vk_id=?", (ctx.user_id,)).fetchone()
+                if exists:
+                    c.execute("DELETE FROM hire_opt_out WHERE vk_id=?", (ctx.user_id,))
+                    self.send(ctx.peer_id, "✅ Вы снова будете получать предложения о найме.")
+                else:
+                    c.execute("INSERT OR IGNORE INTO hire_opt_out(vk_id) VALUES(?)", (ctx.user_id,))
+                    self.send(ctx.peer_id, "✅ Вы больше не будете получать предложения о найме (если у вас есть текущая должность).")
+            return
+
+        if cmd == "!уволиться":
+            # Работает и в чате и в ЛС
+            u = self._user(ctx.user_id)
+            if not u or not u["faction"]:
+                self.send(ctx.peer_id, "❌ Вы не состоите ни в одной фракции.")
+                return
+            reason = " ".join(parts[1:]).strip() if len(parts) > 1 else "причина не указана"
+            reason = self._sanitize_input(reason, 300)
+            faction = u["faction"]
+            server_id = int(u["server_id"] or 1)  # Сервер ПОЛЬЗОВАТЕЛЯ — ключевой для поиска лидера
+            # Ищем лидера строго по фракции И серверу пользователя
+            with self.db.conn() as c:
+                leader_row = c.execute(
+                    "SELECT vk_id FROM leaders WHERE faction=? AND server_id=? LIMIT 1",
+                    (faction, server_id),
+                ).fetchone()
+                # Только если лидера на этом сервере нет — берём любого лидера фракции
+                if not leader_row:
+                    leader_row = c.execute(
+                        "SELECT vk_id FROM leaders WHERE faction=? ORDER BY server_id LIMIT 1",
+                        (faction,),
+                    ).fetchone()
+                leader_id = int(leader_row["vk_id"]) if leader_row else None
+                # Если лидер не найден — увольняем автоматически без сохранения запроса
+                if leader_id is None:
+                    c.execute(
+                        "UPDATE users SET faction='не указана', position='не указана' WHERE vk_id=?",
+                        (ctx.user_id,),
+                    )
+                    auto_msg = (
+                        f"✅ Лидер вашей фракции не назначен.\n"
+                        "Увольнение выполнено автоматически. Фракция и должность сброшены."
+                    )
+                    if ctx.is_chat:
+                        self.send(ctx.peer_id, auto_msg)
+                    self.send_dm(ctx.user_id, auto_msg)
+                    return
+                # Сохраняем pending запрос с server_id
+                c.execute(
+                    "INSERT OR REPLACE INTO resign_requests(user_id,reason,faction,server_id,leader_id,created_at,step)"
+                    " VALUES(?,?,?,?,?,?,'user_confirm')",
+                    (ctx.user_id, reason, faction, server_id, leader_id, self.now_ts()),
+                )
+            # Подтверждение всегда уходит в ЛС
+            self._send_resign_user_confirm(ctx, reason)
+            if ctx.is_chat:
+                self.send(ctx.peer_id, "📩 Запрос на увольнение отправлен вам в личные сообщения для подтверждения.")
             return
 
         if cmd == "!голос" and ctx.is_chat:
@@ -2923,6 +4880,166 @@ class FactionBot:
                 )
             self.send(ctx.peer_id, f"✅ Пользователю {self._fmt_user(target)} выдан голос на 20 минут.")
             return
+
+        # ─── Глобальные списки ─────────────────────────────────────────────────
+
+        if cmd == "!новый список":
+            # Формат: ответом на сообщение — !новый список (название) (уровень)
+            # Уровень = минимальный admin_level для просмотра (0 = все)
+            # Содержимое берётся из reply_text без изменений
+            user_adm = self._get_admin_level(ctx.user_id)
+            # Права: любой пользователь (нет ограничений по admin_level)
+            # parts: ["!новый", "список", <name_tokens...>, <level>?]
+            if len(parts) < 3:
+                self.send(ctx.peer_id, "Формат (ответом на сообщение): !новый список (название) [уровень]")
+                return
+            # Парсим уровень — последний токен если число
+            if parts[-1].isdigit():
+                list_admin = int(parts[-1])
+                list_name = " ".join(parts[2:-1]).strip()
+            else:
+                list_admin = 0  # По умолчанию — для всех
+                list_name = " ".join(parts[2:]).strip()
+            if not list_name:
+                self.send(ctx.peer_id, "❌ Укажите название списка.")
+                return
+            if len(list_name) > 80:
+                self.send(ctx.peer_id, "❌ Название списка слишком длинное (макс. 80 символов).")
+                return
+            if list_admin < 0 or list_admin > 100:
+                self.send(ctx.peer_id, "❌ Уровень доступа должен быть от 0 до 100.")
+                return
+            # Содержимое — из reply_text (обязательно)
+            if not ctx.reply_text or not ctx.reply_text.strip():
+                self.send(ctx.peer_id, "❌ Команда должна быть ответом на сообщение. Содержимое списка берётся из того сообщения.")
+                return
+            content = ctx.reply_text  # сохраняем как есть, без изменений
+            ok = self.lists_db.create_list(list_name, list_admin, ctx.user_id, self.now_ts())
+            if ok:
+                # Сразу записываем содержимое
+                self.lists_db.update_list(list_name, content, self.now_ts())
+                self.send(ctx.peer_id, f"✅ Список «{list_name}» создан. Уровень доступа: {list_admin}+ (0 = все).\n!список {list_name}")
+            else:
+                self.send(ctx.peer_id, f"❌ Список с названием «{list_name}» уже существует.")
+            return
+
+        if cmd == "!список доступ":
+            # !список доступ (название) — показать кому доступен список
+            # !список доступ + (пользователь) (название) — выдать доступ
+            user_adm = self._get_admin_level(ctx.user_id)
+
+            if len(parts) >= 2 and parts[1] == "+":
+                # !список доступ + (пользователь) (название списка)
+                if len(parts) < 4:
+                    self.send(ctx.peer_id, "❌ Недостаточно аргументов.\nФормат: !список доступ + (пользователь) (название списка)")
+                    return
+                uid = self._parse_user_fast(parts[2]) or self._parse_user(parts[2])
+                if not uid:
+                    self.send(ctx.peer_id, "❌ Не удалось определить пользователя.\nФормат: !список доступ + (пользователь) (название списка)")
+                    return
+                list_name = " ".join(parts[3:]).strip()
+                if not list_name:
+                    self.send(ctx.peer_id, "❌ Укажите название списка.\nФормат: !список доступ + (пользователь) (название списка)")
+                    return
+                ok, err = self.lists_db.grant_access(list_name, uid, ctx.user_id, self.now_ts())
+                if ok:
+                    self.send(ctx.peer_id, f"✅ {self._fmt_user(uid)} получил персональный доступ к списку «{list_name}».\nТеперь этот список появится у него в !все списки.")
+                else:
+                    self.send(ctx.peer_id, f"❌ {err}")
+                return
+            else:
+                # !список доступ (название) — показать все доступы
+                list_name = " ".join(parts[1:]).strip()
+                if not list_name:
+                    self.send(ctx.peer_id, "❌ Укажите название списка.\nФормат: !список доступ (название списка)")
+                    return
+                with self.lists_db.conn() as lc:
+                    meta = lc.execute(
+                        "SELECT min_admin_level FROM global_lists WHERE LOWER(name)=LOWER(?)", (list_name,)
+                    ).fetchone()
+                if not meta:
+                    self.send(ctx.peer_id, f"❌ Список «{list_name}» не найден.")
+                    return
+                min_adm = int(meta["min_admin_level"])
+                personal_entries = self.lists_db.get_access_entries(list_name)
+                lines = [f"🔐 Доступ к списку «{list_name}»:",
+                         f"• Минимальный admin-уровень: {min_adm if min_adm > 0 else 'без ограничений (публичный)'}"]
+                if min_adm > 0:
+                    with self.db.conn() as c:
+                        level_users = c.execute(
+                            "SELECT vk_id FROM users WHERE admin_level>=? LIMIT 20", (min_adm,)
+                        ).fetchall()
+                    if level_users:
+                        lines.append("• По уровню admin: " + ", ".join(self._fmt_user(r["vk_id"]) for r in level_users))
+                    else:
+                        lines.append("• По уровню admin: никто")
+                if personal_entries:
+                    lines.append("• Персональный доступ: " + ", ".join(self._fmt_user(r["vk_id"]) for r in personal_entries))
+                else:
+                    lines.append("• Персональный доступ: не выдан")
+                self.send(ctx.peer_id, "\n".join(lines))
+                return
+
+        if cmd == "!список":
+            # !список (название) — показать список (поиск без учёта регистра, с учётом персонального доступа)
+            if len(parts) < 2:
+                self.send(ctx.peer_id, "Формат: !список (название)")
+                return
+            user_adm = self._get_admin_level(ctx.user_id)
+            list_name = " ".join(parts[1:]).strip()
+            if not list_name:
+                self.send(ctx.peer_id, "❌ Укажите название списка.")
+                return
+            lst = self.lists_db.get_list(list_name, user_adm, vk_id=ctx.user_id)
+            if lst is None:
+                with self.lists_db.conn() as lc:
+                    row = lc.execute("SELECT min_admin_level FROM global_lists WHERE LOWER(name)=LOWER(?)", (list_name,)).fetchone()
+                if row:
+                    self.send(ctx.peer_id, f"⛔ Недостаточно прав для просмотра списка «{list_name}» (требуется admin {row['min_admin_level']}+, или запросите персональный доступ).")
+                else:
+                    self.send(ctx.peer_id, f"❌ Список «{list_name}» не найден.")
+                return
+            content = lst["content"]
+            level_str = f"admin {lst['min_admin_level']}+" if lst["min_admin_level"] > 0 else "публичный"
+            header = f"📋 {lst['name']} ({level_str}):"
+            self.send(ctx.peer_id, f"{header}\n{content}" if content.strip() else f"📋 Список «{lst['name']}» пуст.")
+            return
+
+        if cmd in {"!все списки", "!списки"}:
+            user_adm = self._get_admin_level(ctx.user_id)
+            all_lists = self.lists_db.all_lists(user_adm, vk_id=ctx.user_id)
+            if not all_lists:
+                self.send(ctx.peer_id, "📋 Нет доступных списков.")
+                return
+            out = [f"📋 Доступные вам списки (admin {user_adm}):"]
+            for lst in all_lists:
+                level_str = f"admin {lst['min_admin_level']}+" if lst["min_admin_level"] > 0 else "публичный"
+                # Пометка если доступ персональный (нет нужного admin уровня)
+                personal_mark = ""
+                if lst["min_admin_level"] > 0 and user_adm < lst["min_admin_level"]:
+                    personal_mark = " (персональный доступ)"
+                out.append(f"• {lst['name']}  [{level_str}]{personal_mark}  — !список {lst['name']}")
+            self.send(ctx.peer_id, "\n".join(out))
+            return
+
+        if cmd == "!удалить список":
+            need_adm = self._get_admin_min("!удалить список")
+            user_adm = self._get_admin_level(ctx.user_id)
+            if user_adm < need_adm and not self._is_senior_admin_ctx(ctx):
+                self.send(ctx.peer_id, f"⛔ Для удаления списка нужен админ-уровень {need_adm}+.")
+                return
+            list_name = " ".join(parts[2:]).strip()
+            if not list_name:
+                self.send(ctx.peer_id, "Формат: !удалить список (название)")
+                return
+            ok = self.lists_db.delete_list(list_name)
+            if ok:
+                self.send(ctx.peer_id, f"✅ Список «{list_name}» удалён.")
+            else:
+                self.send(ctx.peer_id, f"❌ Список «{list_name}» не найден.")
+            return
+
+        # ─────────────────────────────────────────────────────────────────────
 
         if cmd == "!допрассм":
             if len(parts) >= 5 and parts[1] == "+" and parts[-1] in {"1", "2", "3"}:
@@ -2955,22 +5072,39 @@ class FactionBot:
             self.send(ctx.peer_id, "Формат: !допрассм + (пользователь) (фракция) (номер сервера) или !допрассм - (пользователь)")
             return
 
-        if cmd == "!отключить" and len(parts) >= 2 and parts[1].lower() == "чат" and ctx.is_chat:
-            if self._get_admin_level(ctx.user_id) < 40:
+        # !отключить чат — работает с обоими вариантами команды
+        _is_disable_cmd = (cmd == "!отключить чат") or (cmd == "!отключить" and len(parts) >= 2 and parts[1].lower() == "чат")
+        if _is_disable_cmd and ctx.is_chat:
+            if self._get_admin_level(ctx.user_id) < 40 and not self._is_senior_admin_ctx(ctx):
                 self.send(ctx.peer_id, "⛔ Команда доступна админам 40+.")
                 return
             with self.db.conn() as c:
+                ch = c.execute("SELECT enabled FROM chat_controls WHERE chat_id=?", (ctx.chat_id,)).fetchone()
+                current = True if not ch else bool(int(ch["enabled"]))
+                if not current:
+                    self.send(ctx.peer_id, "ℹ️ Чат уже отключён. Для включения: !включить чат")
+                    return
                 c.execute("INSERT OR REPLACE INTO chat_controls(chat_id,enabled) VALUES(?,0)", (ctx.chat_id,))
-            self.send(ctx.peer_id, "✅ Чат отключен для команд бота.")
+            self.send(ctx.peer_id,
+                "🔕 Чат отключён. Бот игнорирует команды всех пользователей (кроме старшего админа).\n"
+                "Для включения: !включить чат"
+            )
             return
 
-        if cmd == "!включить" and len(parts) >= 2 and parts[1].lower() == "чат" and ctx.is_chat:
-            if self._get_admin_level(ctx.user_id) < 40:
+        # !включить чат — работает с обоими вариантами команды
+        _is_enable_cmd = (cmd == "!включить чат") or (cmd == "!включить" and len(parts) >= 2 and parts[1].lower() == "чат")
+        if _is_enable_cmd and ctx.is_chat:
+            if self._get_admin_level(ctx.user_id) < 40 and not self._is_senior_admin_ctx(ctx):
                 self.send(ctx.peer_id, "⛔ Команда доступна админам 40+.")
                 return
             with self.db.conn() as c:
+                ch = c.execute("SELECT enabled FROM chat_controls WHERE chat_id=?", (ctx.chat_id,)).fetchone()
+                current = True if not ch else bool(int(ch["enabled"]))
+                if current:
+                    self.send(ctx.peer_id, "ℹ️ Чат уже включён.")
+                    return
                 c.execute("INSERT OR REPLACE INTO chat_controls(chat_id,enabled) VALUES(?,1)", (ctx.chat_id,))
-            self.send(ctx.peer_id, "✅ Чат снова подключен к системе бота.")
+            self.send(ctx.peer_id, "🔔 Чат включён. Бот снова принимает команды от всех пользователей.")
             return
 
         if cmd == "!команда":
@@ -3036,8 +5170,10 @@ class FactionBot:
                     if self._api_method("messages.delete", payload):
                         deleted = 1
                         break
-                if not deleted:
-                    self.send_ephemeral(ctx.peer_id, "❌ Не удалось удалить сообщение(я).", ttl_sec=5)
+                if deleted:
+                    self.send(ctx.peer_id, "✅ Сообщение удалено.")
+                else:
+                    self.send(ctx.peer_id, "❌ Не удалось удалить сообщение.")
                 return
             if len(parts) < 2:
                 self.send(ctx.peer_id, "Формат: !чистка (количество) или !чистка (время: 10м/2ч) или reply без аргументов.")
@@ -3133,15 +5269,20 @@ class FactionBot:
             self.send(ctx.peer_id, f"✅ Данные пользователя {self._fmt_user(target)} раскрыты.")
             return
 
-        if cmd == "!уволить":
+        if cmd in {"!уволить", "!снять"} and (
+            # !снять как синоним уволить — только если следующее слово не "роль/выговор/префикс/рольвезде"
+            cmd == "!уволить" or (
+                len(parts) < 2 or parts[1].lower() not in {"роль", "выговор", "префикс", "рольвезде"}
+            )
+        ):
             actor_admin = self._get_admin_level(ctx.user_id)
             actor_role = self._get_role_level(ctx.chat_id, ctx.user_id) if ctx.is_chat else 0
             if actor_role < 70 and actor_admin < 10:
                 self.send(ctx.peer_id, "⛔ Для команды нужны права: роль 70+ или админ 10+.")
                 return
-            target = (self._parse_user(parts[1]) if len(parts) > 1 else None) or ctx.reply_user_id
+            target = (self._parse_user_fast(parts[1]) or self._parse_user(parts[1]) if len(parts) > 1 else None) or ctx.reply_user_id
             if target is None:
-                self.send(ctx.peer_id, "Формат: !уволить (пользователь)")
+                self.send(ctx.peer_id, "❌ Укажите пользователя.\nФормат: !уволить (пользователь) или ответом на сообщение")
                 return
             actor = self._user(ctx.user_id)
             victim = self._user(target)
@@ -3150,7 +5291,7 @@ class FactionBot:
                 return
             actor_faction = actor["faction"] if actor else None
             actor_server = int(actor["server_id"] or 1) if actor else 1
-            victim_faction = victim["faction"]
+            victim_faction = victim["faction"] or "не указана"
             victim_server = int(victim["server_id"] or 1)
             if actor_faction != SECRET_FACTION and actor_faction != victim_faction:
                 self.send(ctx.peer_id, "⛔ Можно увольнять только из своей фракции.")
@@ -3158,19 +5299,44 @@ class FactionBot:
             if actor_faction != SECRET_FACTION and actor_server != victim_server:
                 self.send(ctx.peer_id, "⛔ Можно увольнять только пользователей своего сервера.")
                 return
+            # Проверка уровня: нельзя уволить человека с уровнем должности выше своего
+            if not self._is_senior_admin_ctx(ctx) and actor_faction != SECRET_FACTION:
+                actor_pos_name = str(actor["position"] if actor and actor["position"] is not None else "")
+                actor_dj = self._dj_find_position(actor_faction, actor_server, actor_pos_name) if actor_pos_name else None
+                actor_level = actor_dj["level"] if actor_dj else 0
+                victim_pos_name = str(victim["position"] if victim["position"] is not None else "")
+                if victim_pos_name and victim_pos_name.lower() != "не указана":
+                    victim_dj = self._dj_find_position(victim_faction, victim_server, victim_pos_name)
+                    victim_level = victim_dj["level"] if victim_dj else 0
+                    if victim_level > actor_level:
+                        self.send(ctx.peer_id, f"⛔ Вы не можете уволить пользователя с должностью уровня {victim_level} (ваш уровень: {actor_level}).")
+                        return
             with self.db.conn() as c:
                 c.execute("UPDATE users SET faction='не указана', position='не указана' WHERE vk_id=?", (target,))
-            self._add_history(
-                nickname=victim["nickname"] or "не указан",
-                target_vk_id=target,
-                old_faction=victim["faction"],
-                old_position=victim["position"],
-                new_faction="не указана",
-                new_position="не указана",
-                actor_vk_id=ctx.user_id,
-                event_type="fire",
-            )
-            self.send(ctx.peer_id, f"✅ Пользователь {self._fmt_user(target)} уволен.")
+                # Также удаляем pending hire offerы для этого пользователя
+                c.execute("DELETE FROM hire_offers WHERE target_user_id=?", (target,))
+            try:
+                self._add_history(
+                    nickname=victim["nickname"] or "не указан",
+                    target_vk_id=target,
+                    old_faction=victim_faction,
+                    old_position=victim["position"],
+                    new_faction="не указана",
+                    new_position="не указана",
+                    actor_vk_id=ctx.user_id,
+                    event_type="fire",
+                )
+            except Exception as e:
+                logger.error(f"_add_history error in !уволить: {e}")
+            actor_name = self.user_name_cache.get(ctx.user_id, (f"id{ctx.user_id}",))[0]
+            self.send(ctx.peer_id, f"✅ Пользователь {self._fmt_user(target)} уволен из фракции {victim_faction}.")
+            try:
+                self.send_dm(target, (
+                    f"⚠️ Вы уволены из фракции {victim_faction} (сервер {victim_server}).\n"
+                    f"Уволил: [id{ctx.user_id}|{actor_name}]"
+                ))
+            except Exception:
+                pass
             return
 
         if cmd == "!нанять":
@@ -3179,42 +5345,117 @@ class FactionBot:
             if actor_role < 70 and actor_admin < 10:
                 self.send(ctx.peer_id, "⛔ Для команды нужны права: роль 70+ или админ 10+.")
                 return
-            target = (self._parse_user(parts[1]) if len(parts) > 1 else None) or ctx.reply_user_id
-            if target is None or len(parts) < 3:
-                self.send(ctx.peer_id, "Формат: !нанять (пользователь) (должность)")
+
+            # Парсим: !нанять (цель) (должность_или_уровень) [уровень если должность не в дж]
+            target = (self._parse_user_fast(parts[1]) or self._parse_user(parts[1]) if len(parts) > 1 else None) or ctx.reply_user_id
+            if target is None:
+                self.send(ctx.peer_id, "❌ Не удалось определить пользователя.\nФормат: !нанять (пользователь) (должность или уровень)")
                 return
-            new_position = " ".join(parts[2:]).strip()
+
             actor = self._user(ctx.user_id)
             victim = self._user(target)
             if not actor or not victim:
                 self.send(ctx.peer_id, "❌ Пользователь не найден в системе.")
                 return
-            actor_faction = actor["faction"]
+
+            actor_faction = actor["faction"] or ""
             actor_server = int(actor["server_id"] or 1)
-            victim_faction = victim["faction"]
+            victim_faction = victim["faction"] or ""
             victim_server = int(victim["server_id"] or 1)
-            if actor_faction != SECRET_FACTION and victim_faction not in {actor_faction, "не указана", None}:
-                self.send(ctx.peer_id, "⛔ Можно нанимать только из своей фракции или без фракции.")
+
+            # Проверка уровня: нельзя нанять человека с уровнем должности выше своего
+            if not self._is_senior_admin_ctx(ctx):
+                actor_pos_name = str(actor["position"] if actor["position"] is not None else "")
+                actor_pos = self._dj_find_position(actor_faction, actor_server, actor_pos_name) if actor_pos_name else None
+                actor_level = actor_pos["level"] if actor_pos else 0
+                victim_pos_name = str(victim["position"] if victim["position"] is not None else "")
+                if victim_pos_name and victim_pos_name.lower() != "не указана":
+                    victim_pos = self._dj_find_position(victim_faction, victim_server, victim_pos_name)
+                    victim_level = victim_pos["level"] if victim_pos else 0
+                    if victim_level > actor_level:
+                        self.send(ctx.peer_id, f"⛔ Вы не можете нанять пользователя с должностью уровня {victim_level} (ваш уровень: {actor_level}).")
+                        return
+
+            # Проверяем opt-out (только если у цели уже есть должность)
+            victim_has_position = bool((victim["position"] or "").strip()) and (victim["position"] or "").lower() != "не указана"
+            if victim_has_position:
+                with self.db.conn() as c:
+                    opt = c.execute("SELECT 1 FROM hire_opt_out WHERE vk_id=?", (target,)).fetchone()
+                if opt:
+                    self.send(ctx.peer_id, f"⛔ Пользователь {self._fmt_user(target)} отключил получение предложений о работе (!неприниматьдж).")
+                    return
+
+            # Аргументы после цели — это название должности + опционально уровень
+            args_start = 2  # если цель была в parts[1]
+            # Если цель взята из reply — части начинаются с parts[1]
+            if target == ctx.reply_user_id and ctx.reply_user_id is not None and len(parts) >= 2:
+                args_start = 1
+            pos_args = parts[args_start:]
+
+            if not pos_args:
+                self.send(ctx.peer_id, "❌ Укажите должность или уровень ДЖ.\nФормат: !нанять (пользователь) (должность или уровень)")
                 return
-            if actor_faction != SECRET_FACTION and victim_server != actor_server:
-                self.send(ctx.peer_id, "⛔ Можно нанимать только пользователей своего сервера.")
+
+            # Определяем должность и уровень
+            # Если последний аргумент — число, это уровень
+            pos_level: Optional[int] = None
+            pos_name_parts = list(pos_args)
+
+            if pos_name_parts and pos_name_parts[-1].lstrip("-").isdigit():
+                pos_level = int(pos_name_parts[-1])
+                pos_name_parts = pos_name_parts[:-1]
+
+            pos_query = " ".join(pos_name_parts).strip() if pos_name_parts else ""
+
+            # Ищем в ДЖ списке
+            dj_pos: Optional[dict] = None
+            if pos_query:
+                dj_pos = self._dj_find_position(actor_faction, actor_server, pos_query)
+            if dj_pos is None and pos_level is not None:
+                # Ищем по уровню
+                dj_pos = self._dj_find_position(actor_faction, actor_server, str(pos_level))
+
+            if dj_pos:
+                new_position = dj_pos["name"]
+                new_level = dj_pos["level"]
+            elif pos_query:
+                # Должности нет в ДЖ — нужен уровень
+                if pos_level is None:
+                    self.send(ctx.peer_id,
+                        f"⚠️ Должность «{pos_query}» не найдена в ДЖ фракции {actor_faction}.\n"
+                        f"Добавьте её сначала: !дж новая {pos_query} (уровень)\n"
+                        f"Или укажите уровень явно: !нанять (пользователь) {pos_query} (уровень)"
+                    )
+                    return
+                new_position = pos_query
+                new_level = pos_level
+            else:
+                self.send(ctx.peer_id, "❌ Укажите название должности.\nФормат: !нанять (пользователь) (должность)")
                 return
-            if (victim["position"] or "не указана") != "не указана":
-                self.send(ctx.peer_id, "⛔ Нанять можно только пользователя с должностью «не указана».")
-                return
+
+            # Сохраняем оффер в БД
             with self.db.conn() as c:
-                c.execute("UPDATE users SET faction=?, position=?, server_id=? WHERE vk_id=?", (actor_faction, new_position, actor_server, target))
-            self._add_history(
-                nickname=victim["nickname"] or "не указан",
-                target_vk_id=target,
-                old_faction=victim["faction"],
-                old_position=victim["position"],
-                new_faction=actor_faction,
-                new_position=new_position,
-                actor_vk_id=ctx.user_id,
-                event_type="hire",
-            )
-            self.send(ctx.peer_id, f"✅ Пользователь {self._fmt_user(target)} нанят на должность «{new_position}».")
+                # Удаляем старые офферы этому пользователю от этого актора
+                c.execute("DELETE FROM hire_offers WHERE target_user_id=? AND actor_user_id=?", (target, ctx.user_id))
+                cur = c.execute(
+                    "INSERT INTO hire_offers(target_user_id,actor_user_id,faction,server_id,position_name,position_level,old_faction,old_server_id,created_at,step)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,'user_confirm')",
+                    (target, ctx.user_id, actor_faction, actor_server, new_position, new_level,
+                     victim_faction, victim_server, self.now_ts()),
+                )
+                offer_id = cur.lastrowid
+
+            # Отправляем оффер цели
+            ok = self._send_hire_offer_buttons(target, offer_id, actor_faction, new_position)
+            if ok:
+                self.send(ctx.peer_id, f"✅ Предложение о найме отправлено {self._fmt_user(target)} на должность «{new_position}».")
+            else:
+                # Не смогли отправить в ЛС — нанимаем напрямую (нет ЛС-доступа)
+                with self.db.conn() as c:
+                    c.execute("UPDATE users SET faction=?, position=?, server_id=? WHERE vk_id=?",
+                              (actor_faction, new_position, actor_server, target))
+                    c.execute("DELETE FROM hire_offers WHERE id=?", (offer_id,))
+                self.send(ctx.peer_id, f"✅ {self._fmt_user(target)} нанят в {actor_faction} на должность «{new_position}» (ЛС недоступны, принято автоматически).")
             return
 
         if cmd == "!история":
@@ -3364,14 +5605,146 @@ class FactionBot:
             self.send(ctx.peer_id, f"✅ Админ-порог для {target_cmd} = {parts[-1]}.")
             return
 
+        if cmd == "!разрешить":
+            # !разрешить (пользователь) (команда)
+            actor_admin = self._get_admin_level(ctx.user_id)
+            if actor_admin < 30 and not self._is_senior_admin_ctx(ctx):
+                self.send(ctx.peer_id, "⛔ Для !разрешить нужен admin 30+.")
+                return
+            if len(parts) < 3:
+                self.send(ctx.peer_id, "Формат: !разрешить (пользователь) (команда)")
+                return
+            target = (self._parse_user_fast(parts[1]) or self._parse_user(parts[1])) if len(parts) > 1 else None
+            target = target or ctx.reply_user_id
+            if not target:
+                self.send(ctx.peer_id, "❌ Не удалось определить пользователя.")
+                return
+            # Команда — всё что после пользователя
+            cmd_target = " ".join(parts[2:]).strip().lower()
+            if not cmd_target.startswith("!"):
+                cmd_target = "!" + cmd_target
+            cmd_norm = self._normalize_command_name(cmd_target)
+            if cmd_norm not in COMMAND_ACCESS:
+                self.send(ctx.peer_id, f"❌ Неизвестная команда: {cmd_target}")
+                return
+            with self.db.conn() as c:
+                c.execute(
+                    "INSERT OR REPLACE INTO user_cmd_allow(target_vk_id,command,granted_by,granted_at) VALUES(?,?,?,?)",
+                    (target, cmd_norm, ctx.user_id, self.now_ts()),
+                )
+                # Убираем возможный запрет на эту команду
+                c.execute("DELETE FROM user_cmd_deny WHERE target_vk_id=? AND LOWER(command)=LOWER(?)", (target, cmd_norm))
+            self.send(ctx.peer_id, f"✅ Пользователю {self._fmt_user(target)} разрешена команда {cmd_norm}.")
+            try:
+                granter_name = self.user_name_cache.get(ctx.user_id, (f"id{ctx.user_id}",))[0]
+                self.send_dm(target, f"ℹ️ Вам разрешена команда {cmd_norm} (выдал: {granter_name}).")
+            except Exception:
+                pass
+            return
+
+        if cmd == "!запретить":
+            # !запретить (пользователь) (команда)
+            actor_admin = self._get_admin_level(ctx.user_id)
+            if actor_admin < 30 and not self._is_senior_admin_ctx(ctx):
+                self.send(ctx.peer_id, "⛔ Для !запретить нужен admin 30+.")
+                return
+            if len(parts) < 3:
+                self.send(ctx.peer_id, "Формат: !запретить (пользователь) (команда)")
+                return
+            target = (self._parse_user_fast(parts[1]) or self._parse_user(parts[1])) if len(parts) > 1 else None
+            target = target or ctx.reply_user_id
+            if not target:
+                self.send(ctx.peer_id, "❌ Не удалось определить пользователя.")
+                return
+            if int(target) == int(self.db.senior_admin_id):
+                self.send(ctx.peer_id, "⛔ Нельзя запретить команду старшему админу.")
+                return
+            cmd_target = " ".join(parts[2:]).strip().lower()
+            if not cmd_target.startswith("!"):
+                cmd_target = "!" + cmd_target
+            cmd_norm = self._normalize_command_name(cmd_target)
+            if cmd_norm not in COMMAND_ACCESS:
+                self.send(ctx.peer_id, f"❌ Неизвестная команда: {cmd_target}")
+                return
+            with self.db.conn() as c:
+                c.execute(
+                    "INSERT OR REPLACE INTO user_cmd_deny(target_vk_id,command,denied_by,denied_at) VALUES(?,?,?,?)",
+                    (target, cmd_norm, ctx.user_id, self.now_ts()),
+                )
+                c.execute("DELETE FROM user_cmd_allow WHERE target_vk_id=? AND LOWER(command)=LOWER(?)", (target, cmd_norm))
+            self.send(ctx.peer_id, f"✅ Пользователю {self._fmt_user(target)} запрещена команда {cmd_norm}.")
+            return
+
+        if cmd == "!проверка команд":
+            # !проверка команд (пользователь)
+            actor_admin = self._get_admin_level(ctx.user_id)
+            if actor_admin < 30 and not self._is_senior_admin_ctx(ctx):
+                self.send(ctx.peer_id, "⛔ Для !проверка команд нужен admin 30+.")
+                return
+            target = (self._parse_user_fast(parts[1]) or self._parse_user(parts[1])) if len(parts) > 1 else None
+            target = target or ctx.reply_user_id
+            if not target:
+                self.send(ctx.peer_id, "Формат: !проверка команд (пользователь)")
+                return
+            target_admin = self._get_admin_level(target)
+            target_role = self._get_role_level(ctx.chat_id, target) if ctx.is_chat else 0
+            chat_id_ctx = ctx.chat_id if ctx.is_chat else None
+            # Загружаем персональные разрешения/запреты
+            with self.db.conn() as c:
+                allow_rows = c.execute(
+                    "SELECT command, granted_by FROM user_cmd_allow WHERE target_vk_id=?", (target,)
+                ).fetchall()
+                deny_rows = c.execute(
+                    "SELECT command FROM user_cmd_deny WHERE target_vk_id=?", (target,)
+                ).fetchall()
+            allow_map = {r["command"]: r["granted_by"] for r in allow_rows}
+            deny_set = {r["command"] for r in deny_rows}
+            available = []
+            for ccmd in sorted(COMMAND_ACCESS.keys()):
+                cmd_norm2 = ccmd
+                if cmd_norm2 in deny_set:
+                    continue
+                if cmd_norm2 in allow_map:
+                    granter_cached = self.user_name_cache.get(allow_map[cmd_norm2])
+                    granter_name = granter_cached[0] if granter_cached else f"id{allow_map[cmd_norm2]}"
+                    available.append(f"• {ccmd} (разрешено: {granter_name})")
+                    continue
+                eff_admin = self._get_effective_admin_min(cmd_norm2)
+                need_role = self._required_role(cmd_norm2, chat_id_ctx)
+                if eff_admin > 0:
+                    if target_admin >= eff_admin:
+                        available.append(f"• {ccmd}  [адм.{eff_admin}+]")
+                elif need_role > 0:
+                    if target_role >= need_role:
+                        available.append(f"• {ccmd}  [роль {need_role}+]")
+                else:
+                    available.append(f"• {ccmd}")
+            header = f"🔍 Команды для {self._fmt_user(target)} (адм.{target_admin}, роль {target_role}):"
+            self.send(ctx.peer_id, header + "\n" + "\n".join(available) if available else header + "\nнет доступных команд")
+            return
+
         if cmd == "!узнать":
             target = (self._parse_user(parts[1]) if len(parts) > 1 else None) or ctx.reply_user_id
             if target is None:
                 self.send(ctx.peer_id, "Формат: !узнать (пользователь) или ответом на сообщение")
                 return
+            actor_admin = self._get_admin_level(ctx.user_id)
+            actor_is_leader = self._is_leader_user(ctx.user_id)
+
+            # Проверка для лидеров: могут смотреть только свою фракцию
+            if actor_is_leader and actor_admin < 30 and not self._is_senior_admin_ctx(ctx):
+                actor_u = self._user(ctx.user_id)
+                target_u = self._user(int(target))
+                actor_faction = actor_u["faction"] if actor_u else None
+                target_faction = target_u["faction"] if target_u else None
+                if not actor_faction or actor_faction != target_faction:
+                    target_name = self._fmt_user(int(target))
+                    self.send(ctx.peer_id, f"👤 {target_name}\n⛔ Этот пользователь не из вашей фракции. Доступ ограничен.")
+                    return
+
             with self.db.conn() as c:
                 tu = c.execute("SELECT hidden FROM users WHERE vk_id=?", (int(target),)).fetchone()
-            if tu and int(tu["hidden"] or 0) == 1 and self._get_admin_level(ctx.user_id) < 30:
+            if tu and int(tu["hidden"] or 0) == 1 and actor_admin < 30:
                 self.send(ctx.peer_id, f"👤 Профиль {self._fmt_user(int(target))}\n🔒 Данные скрыты.")
                 return
             self.send(ctx.peer_id, self._admin_console_text_profile(int(target)))
@@ -3815,6 +6188,21 @@ class FactionBot:
             self.send(ctx.peer_id, f"✅ Профиль {self._fmt_user(target)} одобрен.")
             return
 
+        if cmd in {"!пуш-", "!пуш+"} and ctx.is_chat:
+            actor_admin = self._get_admin_level(ctx.user_id)
+            actor_role = self._get_role_level(ctx.chat_id, ctx.user_id)
+            if actor_role < 70 and actor_admin < 10:
+                self.send(ctx.peer_id, "⛔ Для управления пушами нужна роль 70+ или admin 10+.")
+                return
+            with self.db.conn() as c:
+                if cmd == "!пуш-":
+                    c.execute("INSERT OR IGNORE INTO chat_push_disabled(chat_id) VALUES(?)", (ctx.chat_id,))
+                    self.send(ctx.peer_id, "🔕 Пуши отключены в этом чате. Команда !пуш сюда больше не присылает уведомлений.")
+                else:
+                    c.execute("DELETE FROM chat_push_disabled WHERE chat_id=?", (ctx.chat_id,))
+                    self.send(ctx.peer_id, "🔔 Пуши включены в этом чате. Уведомления снова будут приходить.")
+            return
+
         if cmd == "!пуш" and ctx.is_chat:
             actor_admin = self._get_admin_level(ctx.user_id)
             actor_role = self._get_role_level(ctx.chat_id, ctx.user_id)
@@ -3828,66 +6216,94 @@ class FactionBot:
                 self.send(ctx.peer_id, "❌ У вас не указана фракция.")
                 return
 
-            target_faction = faction
+            # Пуш работает ТОЛЬКО ответом на сообщение
+            push_text = (ctx.reply_text or "").strip()
             push_attachments = ctx.reply_attachment_ids or []
-            if faction == SECRET_FACTION:
-                if len(parts) < 2:
-                    self.send(ctx.peer_id, "Формат для Админ: !пуш (фракция) (текст) или ответом на сообщение.")
-                    return
-                if parts[1].lower() in {"все", "all"}:
-                    target_faction = "__ALL__"
-                    rest = parts[2:]
-                    text_to_push = " ".join(rest).strip() or (ctx.reply_text or "").strip()
-                    if not text_to_push:
-                        self.send(ctx.peer_id, "Формат: !пуш все (текст) или ответом на сообщение.")
-                        return
-                    with self.db.conn() as c:
-                        chats = c.execute("SELECT chat_id FROM chats").fetchall()
-                    sent = 0
-                    for row in chats:
-                        chat_id = int(row["chat_id"])
-                        try:
-                            if push_attachments and ctx.platform == "vk":
-                                self.send_with_attachments(self._chat_peer_id(chat_id), f"📢 Глобальный пуш от {self._fmt_user(ctx.user_id)}\n{text_to_push}", push_attachments)
-                            else:
-                                self.send(self._chat_peer_id(chat_id), f"📢 Глобальный пуш от {self._fmt_user(ctx.user_id)}\n{text_to_push}")
-                            sent += 1
-                        except Exception:
-                            continue
-                    self.send(ctx.peer_id, f"✅ Сообщение отправлено в {sent} чат(ов) (все фракции).")
-                    return
-                tf, rest = self._extract_faction_and_rest(parts, 1)
-                if not tf:
-                    self.send(ctx.peer_id, "❌ Для Админ-фракции нужно указать целевую фракцию.")
-                    return
-                target_faction = tf
-                text_to_push = " ".join(rest).strip() or (ctx.reply_text or "").strip()
-            else:
-                text_to_push = " ".join(parts[1:]).strip() or (ctx.reply_text or "").strip()
-
-            if not text_to_push:
-                self.send(ctx.peer_id, "Формат: !пуш (текст) или ответом на сообщение с текстом.")
+            if not push_text and not push_attachments:
+                self.send(ctx.peer_id,
+                    "❌ !пуш работает только ответом на сообщение.\n"
+                    "Ответьте на нужное сообщение командой !пуш (или !пуш (фракция) (сервер) для Админ).")
                 return
 
-            with self.db.conn() as c:
-                if faction == SECRET_FACTION:
-                    chats = c.execute("SELECT chat_id FROM chats WHERE faction=?", (target_faction,)).fetchall()
+            args = parts[1:]
+
+            # Определяем наличие @all в аргументах
+            mention_all = any(a.lower() == "@all" for a in args)
+            args_clean = [a for a in args if a.lower() != "@all"]
+
+            target_faction = faction
+            target_server: Optional[int] = actor_server
+
+            if faction == SECRET_FACTION:
+                # Для Админ: !пуш (фракция) (сервер) или !пуш все
+                if not args_clean:
+                    self.send(ctx.peer_id,
+                        "Формат для Админ-фракции (ответом на сообщение):\n"
+                        "• !пуш (фракция) (сервер) — пуш во фракцию на сервер\n"
+                        "• !пуш все — пуш во все чаты\n"
+                        "Добавьте @all для пинга всех: !пуш армия 1 @all")
+                    return
+                if args_clean[0].lower() in {"все", "all"}:
+                    target_faction = "__ALL__"
+                    target_server = None
                 else:
-                    chats = c.execute("SELECT chat_id FROM chats WHERE faction=? AND server_id=?", (target_faction, actor_server)).fetchall()
+                    tf, rest_tokens = self._extract_faction_and_rest(["!пуш"] + args_clean, 1)
+                    if not tf:
+                        self.send(ctx.peer_id, "❌ Не удалось определить фракцию.")
+                        return
+                    target_faction = tf
+                    if rest_tokens and rest_tokens[0].isdigit():
+                        target_server = int(rest_tokens[0])
+                    else:
+                        target_server = None
+
+            # Готовим текст
+            all_prefix = "@all\n" if mention_all else ""
+            full_text = f"📢 Пуш от {self._fmt_user(ctx.user_id)}\n{all_prefix}{push_text}" if push_text else f"📢 Пуш от {self._fmt_user(ctx.user_id)}\n{all_prefix}[вложение]"
+
+            with self.db.conn() as c:
+                if target_faction == "__ALL__":
+                    chats = c.execute("SELECT chat_id FROM chats").fetchall()
+                elif target_server is not None:
+                    chats = c.execute(
+                        "SELECT chat_id FROM chats WHERE faction=? AND server_id=?",
+                        (target_faction, target_server),
+                    ).fetchall()
+                else:
+                    chats = c.execute("SELECT chat_id FROM chats WHERE faction=?", (target_faction,)).fetchall()
+
+            if not chats:
+                srv_lbl = f" сервера {target_server}" if target_server else ""
+                self.send(ctx.peer_id, f"⚠️ Нет чатов для {target_faction}{srv_lbl}.")
+                return
+
+            # Загружаем чаты у которых пуш отключён
+            with self.db.conn() as c:
+                disabled_rows = c.execute("SELECT chat_id FROM chat_push_disabled").fetchall()
+            disabled_chats = {int(r["chat_id"]) for r in disabled_rows}
+
             sent = 0
             for row in chats:
                 chat_id = int(row["chat_id"])
+                # Пропускаем чат где написали !пуш
+                if ctx.is_chat and chat_id == ctx.chat_id:
+                    continue
+                # Пропускаем чаты с отключёнными пушами
+                if chat_id in disabled_chats:
+                    continue
                 try:
                     if push_attachments and ctx.platform == "vk":
-                        self.send_with_attachments(self._chat_peer_id(chat_id), f"📢 Фракционный пуш от {self._fmt_user(ctx.user_id)}\n{text_to_push}", push_attachments)
+                        self.send_with_attachments(self._chat_peer_id(chat_id), full_text, push_attachments)
                     else:
-                        self.send(self._chat_peer_id(chat_id), f"📢 Фракционный пуш от {self._fmt_user(ctx.user_id)}\n{text_to_push}")
+                        self.send(self._chat_peer_id(chat_id), full_text)
                     sent += 1
                 except Exception:
                     continue
-            self.send(ctx.peer_id, f"✅ Сообщение отправлено в {sent} чат(ов) фракции {target_faction}.")
-            return
 
+            target_label = target_faction if target_faction != "__ALL__" else "все фракции"
+            srv_label = f" (сервер {target_server})" if target_server else ""
+            self.send(ctx.peer_id, f"✅ Пуш отправлен в {sent} чат(ов): {target_label}{srv_label}.")
+            return
         if cmd == "!создать" and ctx.is_chat and len(parts) >= 4 and parts[1].lower() == "роль":
             role_name = " ".join(parts[2:-1])
             level = int(parts[-1])
@@ -3948,22 +6364,18 @@ class FactionBot:
             return
 
         if cmd == "!роли" and ctx.is_chat:
-            def _load_roles() -> list[sqlite3.Row]:
-                with self.db.conn() as c:
-                    return c.execute(
-                        "SELECT level,name FROM chat_roles WHERE chat_id=? ORDER BY level DESC",
-                        (ctx.chat_id,),
-                    ).fetchall()
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                rows = pool.submit(_load_roles).result()
+            with self.db.conn() as c:
+                rows = c.execute(
+                    "SELECT level, name FROM chat_roles WHERE chat_id=? ORDER BY level DESC",
+                    (ctx.chat_id,),
+                ).fetchall()
             if not rows:
                 self.send(ctx.peer_id, "ℹ️ Роли не созданы.")
             else:
-                lines = [f"• {r['name']} — {r['level']}" for r in rows]
-                chunk_size = 20
-                for i in range(0, len(lines), chunk_size):
-                    header = "📋 Роли:\n" if i == 0 else "📋 Роли (продолжение):\n"
-                    self.send(ctx.peer_id, header + "\n".join(lines[i:i + chunk_size]))
+                out = ["📋 Роли чата:"]
+                for r in rows:
+                    out.append(f"• {r['name']} — уровень {r['level']}")
+                self.send(ctx.peer_id, "\n".join(out))
             return
 
         if cmd == "!роль" and ctx.is_chat:
@@ -4151,8 +6563,38 @@ class FactionBot:
             return
 
         # admin-only globals
-        if cmd == "!стереть" and len(parts) >= 2:
+        if cmd == "!аудит" and len(parts) >= 2 and parts[1].lower() == "файлы":
             if not self._is_senior_admin_ctx(ctx):
+                self.send(ctx.peer_id, "⛔ Только старший админ.")
+                return
+            results = ["🔍 Аудит файлов:"]
+            check_files = ["bot1.py", ".env", "bot.db", "lists.db", "catalogs.db"]
+            for fname in check_files:
+                fpath = os.path.join(BASE_DIR, fname)
+                if not os.path.exists(fpath):
+                    results.append(f"• {fname}: ❌ не найден")
+                    continue
+                try:
+                    h = hashlib.sha256()
+                    with open(fpath, "rb") as fh_:
+                        for chunk in iter(lambda: fh_.read(65536), b""):
+                            h.update(chunk)
+                    size_kb = os.path.getsize(fpath) // 1024
+                    mtime = int(os.path.getmtime(fpath))
+                    dt_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+                    results.append(f"• {fname}: sha256={h.hexdigest()[:20]}... | {size_kb}KB | изм: {dt_str}")
+                except Exception as ex:
+                    results.append(f"• {fname}: ⚠️ ошибка — {ex}")
+            self.send(ctx.peer_id, "\n".join(results))
+            return
+
+        if cmd == "!стереть" and len(parts) >= 2:
+            # Double-check: читаем admin_level из БД (не из кэша) + проверяем сессию
+            with self.db.conn() as _c:
+                _sa_row = _c.execute("SELECT admin_level FROM users WHERE vk_id=?", (ctx.user_id,)).fetchone()
+            _db_lvl = int(_sa_row["admin_level"]) if _sa_row else 0
+            if not self._is_senior_admin_ctx(ctx) or _db_lvl < 100:
+                logger.warning(f"Unauthorized !стереть attempt: user={ctx.user_id} db_level={_db_lvl}")
                 self.send(ctx.peer_id, "⛔ Команда !стереть доступна только старшему админу.")
                 return
             target = self._parse_user(parts[1]) or ctx.reply_user_id
@@ -4172,7 +6614,11 @@ class FactionBot:
             return
 
         if cmd == "!облик" and len(parts) >= 3 and parts[1] == "0":
-            if not self._is_senior_admin_ctx(ctx):
+            with self.db.conn() as _c:
+                _sa_row = _c.execute("SELECT admin_level FROM users WHERE vk_id=?", (ctx.user_id,)).fetchone()
+            _db_lvl = int(_sa_row["admin_level"]) if _sa_row else 0
+            if not self._is_senior_admin_ctx(ctx) or _db_lvl < 100:
+                logger.warning(f"Unauthorized !облик attempt: user={ctx.user_id} db_level={_db_lvl}")
                 self.send(ctx.peer_id, "⛔ Команда !облик доступна только старшему админу.")
                 return
             target = self._parse_user(parts[2]) or ctx.reply_user_id
@@ -4226,18 +6672,33 @@ class FactionBot:
             return
 
         if cmd == "!админ" and len(parts) == 4 and parts[1].lower() in {"права", "роль"}:
-            if not self._is_senior_admin_ctx(ctx):
+            with self.db.conn() as _c:
+                _sa_row = _c.execute("SELECT admin_level FROM users WHERE vk_id=?", (ctx.user_id,)).fetchone()
+            _db_lvl = int(_sa_row["admin_level"]) if _sa_row else 0
+            if not self._is_senior_admin_ctx(ctx) or _db_lvl < 100:
+                logger.warning(f"Unauthorized !админ права attempt: user={ctx.user_id} db_level={_db_lvl}")
+                self._alert_senior_admin(f"⚠️ Попытка использовать !админ права: id{ctx.user_id} (db_level={_db_lvl})")
                 self.send(ctx.peer_id, "⛔ Команда !админ права доступна только старшему админу.")
                 return
-            uid = self._parse_user(parts[2])
-            lvl = int(parts[3])
-            if uid is None or not (0 <= lvl <= 100):
+            if not parts[3].lstrip("-").isdigit():
                 self.send(ctx.peer_id, "Формат: !админ права (пользователь) (0..100)")
                 return
+            lvl = int(parts[3])
+            if not (0 <= lvl <= 100):
+                self.send(ctx.peer_id, "❌ Уровень должен быть от 0 до 100.")
+                return
+            
+            uid = self._parse_user_fast(parts[2]) or self._parse_user(parts[2])
+            if uid is None:
+                self.send(ctx.peer_id, "❌ Не удалось найти пользователя.")
+                return
+            
             with self.db.conn() as c:
                 c.execute("INSERT OR IGNORE INTO users(vk_id) VALUES(?)", (uid,))
                 c.execute("UPDATE users SET admin_level=? WHERE vk_id=?", (lvl, uid))
-            self.send(ctx.peer_id, f"✅ Админ уровень {self._fmt_user(uid)} = {lvl}")
+            
+            # ИСПРАВЛЕНО: используем _fmt_user для красивого отображения
+            self.send(ctx.peer_id, f"✅ Пользователю {self._fmt_user(uid)} установлен админ-уровень {lvl}.")
             return
 
         if cmd == "!лидер" and len(parts) >= 4:
@@ -4260,18 +6721,84 @@ class FactionBot:
             self.send(ctx.peer_id, f"✅ Лидер {faction} (сервер {server_id}): {self._fmt_user(uid)}")
             return
 
-        if cmd == "!снятьлидера" and len(parts) >= 2:
-            faction = " ".join(parts[1:]).strip()
-            faction = next((f for f in FACTIONS if f.lower() == faction.lower()), faction)
-            with self.db.conn() as c:
-                row = c.execute("SELECT vk_id FROM leaders WHERE faction=?", (faction,)).fetchone()
-                if not row:
-                    self.send(ctx.peer_id, "❌ Лидер не установлен.")
+        if cmd == "!лидеры":
+            # !лидеры [фракция] — показать всех лидеров или лидеров конкретной фракции
+            filter_faction: Optional[str] = None
+            if len(parts) >= 2:
+                f_input = " ".join(parts[1:]).strip()
+                filter_faction = next((f for f in ALL_FACTIONS if f.lower() == f_input.lower()), None)
+                if not filter_faction:
+                    self.send(ctx.peer_id, f"❌ Фракция не найдена. Доступные: {', '.join(FACTIONS)}")
                     return
-                uid = int(row[0])
-                c.execute("DELETE FROM leaders WHERE faction=?", (faction,))
-                c.execute("UPDATE users SET admin_level=0 WHERE vk_id=?", (uid,))
-            self.send(ctx.peer_id, f"✅ Лидер фракции {faction} снят.")
+            with self.db.conn() as c:
+                if filter_faction:
+                    rows = c.execute(
+                        "SELECT faction, server_id, vk_id FROM leaders WHERE faction=? ORDER BY server_id",
+                        (filter_faction,),
+                    ).fetchall()
+                else:
+                    rows = c.execute(
+                        "SELECT faction, server_id, vk_id FROM leaders ORDER BY faction, server_id"
+                    ).fetchall()
+            if not rows:
+                msg = f"Лидеров фракции {filter_faction} нет." if filter_faction else "Лидеров нет."
+                self.send(ctx.peer_id, f"👑 {msg}")
+                return
+            lines = ["👑 Список лидеров фракций:"]
+            current_faction = None
+            for row in rows:
+                f_name = row["faction"]
+                if f_name != current_faction:
+                    if current_faction is not None:
+                        lines.append("")
+                    lines.append(f"🏛 {f_name}:")
+                    current_faction = f_name
+                uid = int(row["vk_id"])
+                cached = self.user_name_cache.get(uid)
+                if cached:
+                    name_str = cached[0]
+                else:
+                    name_str = f"id{uid}"
+                lines.append(f"  Сервер {row['server_id']}: [id{uid}|{name_str}]")
+            self.send(ctx.peer_id, "\n".join(lines))
+            return
+
+        if cmd == "!снятьлидера" and len(parts) >= 2:
+            # Формат: !снятьлидера (фракция) [сервер]
+            # Если сервер не указан — снимаем со всех серверов
+            faction_parts = parts[1:]
+            server_id_filter: Optional[int] = None
+            if faction_parts and faction_parts[-1].isdigit() and faction_parts[-1] in {"1", "2", "3"}:
+                server_id_filter = int(faction_parts[-1])
+                faction_parts = faction_parts[:-1]
+            faction = " ".join(faction_parts).strip()
+            faction = next((f for f in ALL_FACTIONS if f.lower() == faction.lower()), faction)
+            if not faction:
+                self.send(ctx.peer_id, "❌ Укажите фракцию.")
+                return
+            with self.db.conn() as c:
+                if server_id_filter is not None:
+                    rows = c.execute(
+                        "SELECT vk_id, server_id FROM leaders WHERE faction=? AND server_id=?",
+                        (faction, server_id_filter),
+                    ).fetchall()
+                else:
+                    rows = c.execute("SELECT vk_id, server_id FROM leaders WHERE faction=?", (faction,)).fetchall()
+                if not rows:
+                    self.send(ctx.peer_id, "❌ Лидер не найден.")
+                    return
+                for row in rows:
+                    uid = int(row["vk_id"])
+                    srv = int(row["server_id"])
+                    c.execute("DELETE FROM leaders WHERE faction=? AND server_id=?", (faction, srv))
+                    # Сбрасываем admin_level только если у него нет других позиций лидера
+                    other = c.execute(
+                        "SELECT 1 FROM leaders WHERE vk_id=?", (uid,)
+                    ).fetchone()
+                    if not other:
+                        c.execute("UPDATE users SET admin_level=0 WHERE vk_id=? AND admin_level=10", (uid,))
+            removed = ", ".join(f"сервер {int(r['server_id'])}" for r in rows)
+            self.send(ctx.peer_id, f"✅ Лидер фракции {faction} снят ({removed}).")
             return
 
         if cmd == "!изменить" and len(parts) >= 4:
@@ -4285,12 +6812,19 @@ class FactionBot:
                 self.send(ctx.peer_id, "❌ Укажите новое значение.")
                 return
             admin_lvl = self._get_admin_level(ctx.user_id)
-            field_map = {"фракцию": "faction", "фио": "rp_name", "ник": "nickname", "должность": "position", "сервер": "server_id"}
+            field_map = {
+                "фракцию": "faction", "фио": "rp_name", "ник": "nickname",
+                "должность": "position", "сервер": "server_id", "ник2": "nick2",
+            }
             field = field_map.get(what)
             if not field:
-                self.send(ctx.peer_id, "❌ Раздел изменения: фракцию / фио / ник / должность / сервер.")
+                self.send(ctx.peer_id, "❌ Раздел изменения: фракцию / фио / ник / ник2 / должность / сервер.")
                 return
-            if admin_lvl < 50:
+            # ник2 требует admin 30+
+            if field == "nick2" and admin_lvl < 30 and not self._is_senior_admin_ctx(ctx):
+                self.send(ctx.peer_id, "⛔ Для изменения ник2 нужен admin 30+.")
+                return
+            if admin_lvl < 50 and field != "nick2":
                 if not (5 <= admin_lvl <= 10 and field == "position"):
                     self.send(ctx.peer_id, "⛔ Недостаточно прав. Для admin 5-10 доступно только: !изменить должность.")
                     return
@@ -4310,9 +6844,23 @@ class FactionBot:
                     self.send(ctx.peer_id, "❌ Сервер должен быть 1, 2 или 3.")
                     return
                 new_value = int(new_value)
+            # SECURITY: runtime whitelist check (field пришёл из field_map выше,
+            # но проверяем снова чтобы исключить любые пути обхода)
+            _SAFE_FIELDS = frozenset({"faction", "rp_name", "nickname", "position", "server_id", "nick2"})
+            if field not in _SAFE_FIELDS:
+                logger.critical(f"SQLi attempt in !изменить: field={field!r} actor={ctx.user_id}")
+                self._alert_senior_admin(f"🚨 SQLi попытка в !изменить: поле={field!r}, пользователь id{ctx.user_id}")
+                self.send(ctx.peer_id, "⛔ Недопустимое поле.")
+                return
+            max_lengths = {"faction":100,"rp_name":200,"nickname":100,"position":150,"nick2":100,"server_id":1}
+            if isinstance(new_value, str) and len(new_value) > max_lengths.get(field, 200):
+                self.send(ctx.peer_id, f"❌ Значение слишком длинное (макс. {max_lengths.get(field,200)} симв.).")
+                return
             with self.db.conn() as c:
                 c.execute("INSERT OR IGNORE INTO users(vk_id) VALUES(?)", (target,))
+                # field гарантированно в whitelist — f-string безопасен
                 c.execute(f"UPDATE users SET {field}=? WHERE vk_id=?", (new_value, target))
+            logger.info(f"!изменить actor={ctx.user_id} target={target} field={field} value={str(new_value)[:40]!r}")
             self.send(ctx.peer_id, f"✅ Изменено: {self._fmt_user(target)} -> {what} = {new_value}.")
             return
 
@@ -4364,6 +6912,15 @@ class FactionBot:
             return
 
         if cmd == "!супербан":
+            # DB check: берём admin_level прямо из БД, не из кэша
+            with self.db.conn() as _sc:
+                _superbam_row = _sc.execute("SELECT admin_level FROM users WHERE vk_id=?", (ctx.user_id,)).fetchone()
+            _superbam_lvl = int(_superbam_row["admin_level"]) if _superbam_row else 0
+            _required_superbam = self._get_effective_admin_min("!супербан")
+            if _superbam_lvl < max(_required_superbam, 30) and not self._is_senior_admin_ctx(ctx):
+                logger.warning(f"Unauthorized !супербан: user={ctx.user_id} db_level={_superbam_lvl}")
+                self.send(ctx.peer_id, "⛔ Недостаточно прав для !супербан.")
+                return
             target = (self._parse_user(parts[1]) if len(parts) > 1 else None) or ctx.reply_user_id
             reason = " ".join(parts[2:]).strip() if len(parts) > 2 else "без причины"
             if target is None:
@@ -4871,23 +7428,57 @@ class FactionBot:
             duration_sec = 3600
             reason = "без причины"
             duration_idx = 2 if explicit_target else 1
+            reason_start_idx = duration_idx  # по умолчанию причина начинается с duration_idx
+
             if len(parts) > duration_idx:
-                token = parts[duration_idx].lower()
-                if token.isdigit() and len(parts) > duration_idx + 1:
-                    token = f"{token}{parts[duration_idx + 1].lower()}"
-                    reason_start_idx = duration_idx + 2
-                else:
-                    reason_start_idx = duration_idx + 1
-                m = re.match(r"^(\d+)\s*([чh]|мин|м|m)?$", token, re.I)
-                if m:
-                    val = int(m.group(1))
-                    unit = (m.group(2) or "").lower()
-                    if unit in {"ч", "h"}:
+                # Пробуем распознать время. Возможные форматы:
+                # "30мин", "30 мин", "30 минут", "2ч", "2 ч", "2 часа", "2h", "30m", "30min"
+                # Берём первый токен (или первые два, если они вместе дают "число + единица")
+                tok0 = parts[duration_idx].lower()
+                tok1 = parts[duration_idx + 1].lower() if len(parts) > duration_idx + 1 else ""
+
+                # Расширенный regex: число слитно с единицей (24ч, 30мин, 2h, 30m, 30min)
+                TIME_RE_COMBINED = re.compile(
+                    r"^(\d+)\s*(ч|час|часа|часов|h|hour|hours|мин|минут|минуты|м|m|min|mins|minute|minutes)$",
+                    re.I | re.U,
+                )
+                # Только число — единица в следующем токене
+                TIME_RE_NUM = re.compile(r"^(\d+)$")
+                TIME_RE_UNIT = re.compile(
+                    r"^(ч|час|часа|часов|h|hour|hours|мин|минут|минуты|м|m|min|mins|minute|minutes)$",
+                    re.I | re.U,
+                )
+
+                matched_time = False
+                mc = TIME_RE_COMBINED.match(tok0)
+                if mc:
+                    # Слитный формат: "24ч", "30мин", "2h"
+                    val = int(mc.group(1))
+                    unit = mc.group(2).lower()
+                    if unit in {"ч", "час", "часа", "часов", "h", "hour", "hours"}:
                         duration_sec = val * 3600
                     else:
                         duration_sec = val * 60
-                if len(parts) > reason_start_idx:
-                    reason = " ".join(parts[reason_start_idx:]).strip() or "без причины"
+                    reason_start_idx = duration_idx + 1
+                    matched_time = True
+                elif TIME_RE_NUM.match(tok0) and tok1 and TIME_RE_UNIT.match(tok1):
+                    # Раздельный формат: "24 ч", "30 мин", "2 часа"
+                    val = int(tok0)
+                    unit = tok1.lower()
+                    if unit in {"ч", "час", "часа", "часов", "h", "hour", "hours"}:
+                        duration_sec = val * 3600
+                    else:
+                        duration_sec = val * 60
+                    reason_start_idx = duration_idx + 2
+                    matched_time = True
+
+                # Если время не распознано — весь остаток считается причиной
+                if not matched_time:
+                    reason_start_idx = duration_idx
+
+                reason_parts = parts[reason_start_idx:]
+                if reason_parts:
+                    reason = " ".join(reason_parts).strip() or "без причины"
             until = self.now_ts() + duration_sec
             with self.db.conn() as c:
                 c.execute("UPDATE chat_members SET muted_until=? WHERE chat_id=? AND vk_id=?", (until, ctx.chat_id, target))
@@ -5283,16 +7874,102 @@ class FactionBot:
                 time.sleep(1)
                 continue
             if line == "stopping":
-                print("[BOT] Получена команда stopping из control pipe. Останавливаю бота...")
+                logger.info("Получена команда stopping из control pipe. Останавливаю бота...")
                 self.running = False
                 break
 
+    def _safe_handle_command(self, ctx: "Ctx") -> None:
+        """Обёртка handle_command для ThreadPoolExecutor — ловит все исключения."""
+        try:
+            self.handle_command(ctx)
+        except Exception as e:
+            logger.error(f"Ошибка в потоке обработки команды '{(ctx.text or '')[:40]}': {e}", file=sys.stderr)
+
+    # ── Security helpers ──────────────────────────────────────────────────────
+
+    def _alert_senior_admin(self, message: str) -> None:
+        """Критическое уведомление старшему админу в ЛС VK."""
+        try:
+            senior_id = int(self.db.senior_admin_id)
+            self.api.messages.send(
+                peer_id=senior_id,
+                random_id=0,
+                message=f"🚨 СИСТЕМНОЕ УВЕДОМЛЕНИЕ\n{message}",
+                disable_mentions=1,
+            )
+            logger.warning(f"Alert→senior_admin({senior_id}): {message[:80]}")
+        except Exception as e:
+            logger.error(f"_alert_senior_admin failed: {e}")
+
+    def _security_audit_loop(self) -> None:
+        """Фоновый аудит безопасности каждые 60 минут."""
+        time.sleep(300)  # первая проверка через 5 мин после старта
+        while self.running:
+            try:
+                senior_id = int(self.db.senior_admin_id)
+                with self.db.conn() as c:
+                    # 1. Чужие пользователи с admin_level >= 100
+                    rogue = c.execute(
+                        "SELECT vk_id, admin_level FROM users WHERE admin_level >= 100 AND vk_id != ?",
+                        (senior_id,),
+                    ).fetchall()
+                    if rogue:
+                        names = ", ".join(f"id{r['vk_id']}(lvl={r['admin_level']})" for r in rogue)
+                        logger.critical(f"SECURITY: ТРЕТИЙ+ пользователь с admin>=100: {names}")
+                        self._alert_senior_admin(
+                            f"🚨 ТРЕВОГА: обнаружен пользователь(и) с admin_level 100+\n"
+                            f"(кроме вас, старшего админа):\n{names}\n\n"
+                            "Возможно несанкционированное повышение прав! Проверьте немедленно.\n"
+                            "Для снятия прав: !админ права (пользователь) 0"
+                        )
+                    # 2. Целостность записи старшего админа
+                    sa = c.execute(
+                        "SELECT admin_level, bot_ban FROM users WHERE vk_id=?", (senior_id,)
+                    ).fetchone()
+                    if sa:
+                        if int(sa["admin_level"]) != 100:
+                            logger.critical(f"SECURITY: senior admin_level tampered → {sa['admin_level']}")
+                            c.execute("UPDATE users SET admin_level=100 WHERE vk_id=?", (senior_id,))
+                            self._alert_senior_admin(
+                                f"🚨 Уровень старшего админа изменён на {sa['admin_level']}! Восстановлено до 100."
+                            )
+                        if int(sa["bot_ban"] or 0) == 1:
+                            logger.critical("SECURITY: senior admin got bot_ban=1")
+                            c.execute("UPDATE users SET bot_ban=0 WHERE vk_id=?", (senior_id,))
+                            self._alert_senior_admin("🚨 Старший админ получил ботбан — снято автоматически.")
+                    # 3. Аномальная активность
+                    total_failed = sum(len(dq) for dq in self.failed_access_window.values())
+                    if total_failed > 100:
+                        logger.warning(f"SECURITY: high failed_access_window: {total_failed}")
+                        self._alert_senior_admin(
+                            f"⚠️ Аномальная активность: {total_failed} неудачных попыток доступа за 5 минут."
+                        )
+            except Exception as e:
+                logger.error(f"_security_audit_loop error: {e}")
+            time.sleep(3600)
+
+    def _background_cleanup(self) -> None:
+        """Фоновая задача: чистит просроченные записи каждые 30 минут."""
+        while self.running:
+            try:
+                time.sleep(1800)
+                cutoff_48h = self.now_ts() - 172800
+                cutoff_24h = self.now_ts() - 86400
+                with self.db.conn() as c:
+                    c.execute("DELETE FROM hire_offers WHERE created_at<?", (cutoff_48h,))
+                    c.execute("DELETE FROM resign_requests WHERE created_at<?", (cutoff_24h,))
+                    c.execute("DELETE FROM registration_sessions WHERE 1=1 AND ROWID NOT IN (SELECT ROWID FROM registration_sessions ORDER BY ROWID DESC LIMIT 500)")
+            except Exception as e:
+                logger.error(f"Ошибка фоновой очистки: {e}")
+
     def run(self) -> None:
-        print("[BOT] Запущен VK community bot.")
-        print(f"[BOT] Остановка: echo stopping > {CONTROL_PIPE_PATH}")
+        logger.info("Запущен VK community bot.")
+        logger.info(f"Остановка: echo stopping > {CONTROL_PIPE_PATH}")
         threading.Thread(target=self.control_pipe_listener, daemon=True).start()
+        threading.Thread(target=self._background_cleanup, daemon=True).start()
+        threading.Thread(target=self._security_audit_loop, daemon=True).start()
         if self.tg_token:
-            print("[BOT] Telegram bridge enabled.")
+            logger.info("Telegram bridge enabled.")
             threading.Thread(target=self.telegram_listener, daemon=True).start()
 
         while self.running:
@@ -5302,11 +7979,23 @@ class FactionBot:
                         break
                     if event.type == VkBotEventType.MESSAGE_EVENT:
                         obj = event.object or {}
-                        payload = obj.get("payload") or {}
-                        cmd = str(payload.get("cmd", "")).lower()
+                        raw_payload = obj.get("payload") or {}
+                        # Защита: payload не должен быть слишком большим
+                        if isinstance(raw_payload, str):
+                            if len(raw_payload) > 2048:
+                                continue
+                            try:
+                                raw_payload = json.loads(raw_payload)
+                            except Exception:
+                                raw_payload = {}
+                        if not isinstance(raw_payload, dict):
+                            raw_payload = {}
+                        payload = raw_payload
+                        cmd = str(payload.get("cmd", "")).lower()[:64]  # limit cmd length
                         req_id = int(payload.get("id", 0) or 0)
                         user_id = int(obj.get("user_id", 0) or 0)
                         peer_id = int(obj.get("peer_id", user_id) or user_id)
+                        # ── регистрация: одобрить/отклонить ──────────────────
                         if cmd in {"approve", "reject"} and req_id > 0 and user_id > 0:
                             result = self._approve_reject_by_id(user_id, peer_id, req_id, approve=(cmd == "approve"), actor_platform="vk")
                             self.send(peer_id, result)
@@ -5322,9 +8011,252 @@ class FactionBot:
                                 )
                             except Exception:
                                 pass
-                        if cmd == "sync_approve" and req_id > 0 and user_id > 0:
+
+                        # ── синхронизация аккаунта ───────────────────────────
+                        elif cmd == "sync_approve" and req_id > 0 and user_id > 0:
                             result = self._approve_sync_request(user_id, req_id)
                             self.send(peer_id, result)
+
+                        # ── увольнение: пользователь нажал Да ───────────────
+                        elif cmd == "resign_confirm" and user_id > 0:
+                            press_uid = int(payload.get("uid", user_id))
+                            if press_uid != user_id:
+                                pass  # Чужую кнопку игнорируем
+                            else:
+                                with self.db.conn() as c:
+                                    rr = c.execute(
+                                        "SELECT * FROM resign_requests WHERE user_id=? AND step='user_confirm'",
+                                        (user_id,),
+                                    ).fetchone()
+                                if rr:
+                                    leader_id = rr["leader_id"]
+                                    # Обновляем step
+                                    with self.db.conn() as c:
+                                        c.execute(
+                                            "UPDATE resign_requests SET step='leader_confirm' WHERE user_id=?",
+                                            (user_id,),
+                                        )
+                                    rr_id = rr["id"]
+                                    if leader_id:
+                                        ok = self._send_resign_leader_confirm(leader_id, user_id, rr["reason"], rr_id)
+                                        if ok:
+                                            self.send(user_id, "✅ Запрос на увольнение отправлен лидеру вашей фракции. Ожидайте подтверждения.")
+                                        else:
+                                            # Лидера нет / не доступен — увольняем сразу
+                                            result = self._do_resign(user_id)
+                                            self.send(user_id, f"ℹ️ Лидер недоступен. {result}")
+                                    else:
+                                        # Лидер не назначен — увольняем автоматически
+                                        result = self._do_resign(user_id)
+                                        self.send(user_id, f"ℹ️ Лидер фракции не назначен. {result}")
+                                else:
+                                    self.send(user_id, "❌ Запрос на увольнение не найден или уже обработан.")
+
+                        # ── увольнение: пользователь нажал Нет (отмена) ─────
+                        elif cmd == "resign_cancel" and user_id > 0:
+                            press_uid = int(payload.get("uid", user_id))
+                            if press_uid == user_id:
+                                with self.db.conn() as c:
+                                    c.execute("DELETE FROM resign_requests WHERE user_id=?", (user_id,))
+                                self.send(user_id, "✅ Увольнение отменено.")
+
+                        # ── увольнение: лидер подтвердил ────────────────────
+                        elif cmd == "resign_leader_yes" and req_id > 0 and user_id > 0:
+                            with self.db.conn() as c:
+                                rr = c.execute(
+                                    "SELECT * FROM resign_requests WHERE id=? AND step='leader_confirm'",
+                                    (req_id,),
+                                ).fetchone()
+                            if not rr:
+                                self.send(peer_id, "❌ Запрос не найден или уже обработан.")
+                            elif rr["leader_id"] and int(rr["leader_id"]) != user_id:
+                                self.send(peer_id, "⛔ Подтверждать может только лидер этой фракции.")
+                            else:
+                                result = self._do_resign(int(rr["user_id"]))
+                                self.send(peer_id, result)
+
+                        # ── увольнение: лидер отказал ───────────────────────
+                        elif cmd == "resign_leader_no" and req_id > 0 and user_id > 0:
+                            with self.db.conn() as c:
+                                rr = c.execute(
+                                    "SELECT * FROM resign_requests WHERE id=? AND step='leader_confirm'",
+                                    (req_id,),
+                                ).fetchone()
+                            if not rr:
+                                self.send(peer_id, "❌ Запрос не найден или уже обработан.")
+                            elif rr["leader_id"] and int(rr["leader_id"]) != user_id:
+                                self.send(peer_id, "⛔ Отклонять может только лидер этой фракции.")
+                            else:
+                                with self.db.conn() as c:
+                                    c.execute("DELETE FROM resign_requests WHERE id=?", (req_id,))
+                                try:
+                                    self.send_dm(int(rr["user_id"]), "❌ Ваш запрос на увольнение отклонён лидером.")
+                                except Exception:
+                                    pass
+                                self.send(peer_id, f"✅ Запрос на увольнение от id{rr['user_id']} отклонён.")
+
+                        # ══ Найм: предложение ════════════════════════════════
+                        elif cmd == "hire_accept" and req_id > 0 and user_id > 0:
+                            # Целевой пользователь принял оффер
+                            with self.db.conn() as c:
+                                offer = c.execute(
+                                    "SELECT * FROM hire_offers WHERE id=? AND step='user_confirm'",
+                                    (req_id,),
+                                ).fetchone()
+                            if not offer or int(offer["target_user_id"]) != user_id:
+                                self.send(peer_id, "❌ Предложение не найдено или уже обработано.")
+                            else:
+                                old_fac = str(offer["old_faction"] or "")
+                                old_srv = int(offer["old_server_id"] or 1)
+                                new_fac = str(offer["faction"])
+                                new_pos = str(offer["position_name"])
+                                new_srv = int(offer["server_id"])
+                                actor_id = int(offer["actor_user_id"])
+                                # Применяем найм
+                                with self.db.conn() as c:
+                                    c.execute(
+                                        "UPDATE users SET faction=?, position=?, server_id=? WHERE vk_id=?",
+                                        (new_fac, new_pos, new_srv, user_id),
+                                    )
+                                    c.execute("UPDATE hire_offers SET step='done' WHERE id=?", (req_id,))
+                                self.send(peer_id, f"✅ Вы приняты в {new_fac} на должность «{new_pos}»!")
+                                # Уведомляем нанявшего
+                                try:
+                                    cached = self.user_name_cache.get(user_id)
+                                    name = cached[0] if cached else f"id{user_id}"
+                                    self.send_dm(actor_id, f"✅ [id{user_id}|{name}] принял предложение и нанят в {new_fac} на должность «{new_pos}».")
+                                except Exception:
+                                    pass
+                                # Если у пользователя была старая фракция — спрашиваем про выход из чатов
+                                if old_fac and old_fac != new_fac and old_fac not in {"", "не указана"}:
+                                    self._send_hire_old_chats_question(user_id, req_id, old_fac, old_srv)
+                                    # Уведомляем лидера старой фракции
+                                    with self.db.conn() as c:
+                                        old_leader = c.execute(
+                                            "SELECT vk_id FROM leaders WHERE faction=? AND server_id=? LIMIT 1",
+                                            (old_fac, old_srv),
+                                        ).fetchone()
+                                    if old_leader:
+                                        self._send_leader_kick_question(int(old_leader["vk_id"]), user_id, req_id, old_fac, old_srv)
+
+                        elif cmd == "hire_reject" and req_id > 0 and user_id > 0:
+                            with self.db.conn() as c:
+                                offer = c.execute(
+                                    "SELECT * FROM hire_offers WHERE id=? AND step='user_confirm'",
+                                    (req_id,),
+                                ).fetchone()
+                            if not offer or int(offer["target_user_id"]) != user_id:
+                                self.send(peer_id, "❌ Предложение не найдено или уже обработано.")
+                            else:
+                                actor_id = int(offer["actor_user_id"])
+                                with self.db.conn() as c:
+                                    c.execute("DELETE FROM hire_offers WHERE id=?", (req_id,))
+                                self.send(peer_id, "✅ Вы отклонили предложение о найме.")
+                                try:
+                                    cached = self.user_name_cache.get(user_id)
+                                    name = cached[0] if cached else f"id{user_id}"
+                                    self.send_dm(actor_id, f"❌ [id{user_id}|{name}] отклонил предложение о найме в {offer['faction']}.")
+                                except Exception:
+                                    pass
+
+                        elif cmd == "hire_kick_old" and req_id > 0 and user_id > 0:
+                            # Пользователь согласился выйти из старых чатов
+                            with self.db.conn() as c:
+                                offer = c.execute("SELECT * FROM hire_offers WHERE id=?", (req_id,)).fetchone()
+                            if offer and int(offer["target_user_id"]) == user_id:
+                                old_fac = str(offer["old_faction"])
+                                old_srv = int(offer["old_server_id"])
+                                kicked = self._kick_from_faction_chats(user_id, old_fac, old_srv)
+                                with self.db.conn() as c:
+                                    c.execute("DELETE FROM hire_offers WHERE id=?", (req_id,))
+                                self.send(peer_id, f"✅ Вы удалены из {kicked} чатов фракции {old_fac}.")
+                            else:
+                                self.send(peer_id, "❌ Запрос не найден.")
+
+                        elif cmd == "hire_keep_old" and req_id > 0 and user_id > 0:
+                            with self.db.conn() as c:
+                                c.execute("DELETE FROM hire_offers WHERE id=? AND target_user_id=?", (req_id, user_id))
+                            self.send(peer_id, "✅ Вы остались в старых чатах.")
+
+                        elif cmd == "leader_kick_yes" and user_id > 0:
+                            # Лидер решил кикнуть уволившегося
+                            fired_uid = int(payload.get("uid", 0))
+                            fired_srv = int(payload.get("srv", 1))
+                            fired_fac = str(payload.get("fac", ""))
+                            if fired_uid > 0 and fired_fac:
+                                kicked = self._kick_from_faction_chats(fired_uid, fired_fac, fired_srv)
+                                self.send(peer_id, f"✅ Пользователь id{fired_uid} удалён из {kicked} чатов фракции {fired_fac}.")
+                            else:
+                                self.send(peer_id, "❌ Недостаточно данных для кика.")
+
+                        elif cmd == "leader_kick_no" and user_id > 0:
+                            self.send(peer_id, "✅ Ладно, пользователь остаётся в чатах.")
+
+                        # ── ДЖ в роли ════════════════════════════════════════
+                        elif cmd == "dj_to_roles":
+                            chat_id_cb = int(payload.get("chat_id", 0))
+                            faction_cb = str(payload.get("faction", ""))
+                            server_cb = int(payload.get("server_id", 1))
+                            if not chat_id_cb or not faction_cb:
+                                self.send(peer_id, "❌ Недостаточно данных.")
+                            else:
+                                positions = self._dj_get_positions(faction_cb, server_cb)
+                                if not positions:
+                                    self.send(peer_id, "❌ ДЖ список пуст. Добавьте должности через !дж новая.")
+                                else:
+                                    # Загружаем сотрудников
+                                    with self.db.conn() as c:
+                                        staff_rows = c.execute(
+                                            "SELECT vk_id, position FROM users "
+                                            "WHERE faction=? AND server_id=? AND approved=1 "
+                                            "AND TRIM(COALESCE(position,''))!='' AND LOWER(COALESCE(position,''))!='не указана'",
+                                            (faction_cb, server_cb),
+                                        ).fetchall()
+                                    staff_rows = list(staff_rows)
+
+                                    # Строим маппинг: lower(должность) → уровень из ДЖ
+                                    pos_to_level = {p["name"].strip().lower(): p["level"] for p in positions}
+                                    # Группируем по должности
+                                    staff_by_pos: dict[str, list[int]] = {}
+                                    for s in staff_rows:
+                                        key = str(s["position"] or "").strip().lower()
+                                        staff_by_pos.setdefault(key, []).append(int(s["vk_id"]))
+
+                                    with self.db.conn() as c:
+                                        # 1. Сбрасываем все роли в этом чате
+                                        c.execute("UPDATE chat_members SET role_level=0 WHERE chat_id=?", (chat_id_cb,))
+                                        # 2. Удаляем старые роли и создаём из ДЖ
+                                        c.execute("DELETE FROM chat_roles WHERE chat_id=?", (chat_id_cb,))
+                                        for p in positions:
+                                            c.execute(
+                                                "INSERT OR REPLACE INTO chat_roles(chat_id, level, name) VALUES(?,?,?)",
+                                                (chat_id_cb, p["level"], p["name"]),
+                                            )
+                                        # 3. Назначаем роли сотрудникам — UPSERT в chat_members
+                                        applied = 0
+                                        for pos_key, uids in staff_by_pos.items():
+                                            level = pos_to_level.get(pos_key)
+                                            if level is None:
+                                                continue  # должность не в ДЖ — пропускаем
+                                            for uid in uids:
+                                                # UPSERT: если записи нет — создаём, если есть — обновляем
+                                                c.execute(
+                                                    "INSERT INTO chat_members(chat_id, vk_id, role_level, immunity_level, banned) "
+                                                    "VALUES(?,?,?,0,0) "
+                                                    "ON CONFLICT(chat_id,vk_id) DO UPDATE SET role_level=excluded.role_level",
+                                                    (chat_id_cb, uid, level),
+                                                )
+                                                applied += 1
+
+                                    self.send(peer_id,
+                                        f"✅ Синхронизация завершена.\n"
+                                        f"Ролей создано: {len(positions)}\n"
+                                        f"Сотрудников назначено: {applied}"
+                                    )
+
+                        elif cmd == "dj_to_roles_cancel":
+                            self.send(peer_id, "✅ Отменено.")
+
                         continue
                     if event.type != VkBotEventType.MESSAGE_NEW:
                         continue
@@ -5372,6 +8304,35 @@ class FactionBot:
                                     "поэтому был автоматически удалён из беседы.",
                                 )
                                 continue
+
+                            # Проверка прав на приглашение: кто добавил (user_id)?
+                            with self.db.conn() as c:
+                                invite_cfg = c.execute(
+                                    "SELECT min_role, min_admin FROM chat_invite_level WHERE chat_id=?",
+                                    (ctx.chat_id,),
+                                ).fetchone()
+                            if invite_cfg:
+                                req_role = int(invite_cfg["min_role"])
+                                req_adm = int(invite_cfg["min_admin"])
+                                inviter_role = self._get_role_level(ctx.chat_id, user_id)
+                                inviter_adm = self._get_admin_level(user_id)
+                                has_invite_right = (
+                                    inviter_adm >= req_adm > 0
+                                    or inviter_role >= req_role
+                                    or self._is_senior_admin_ctx(ctx)
+                                    or int(user_id) == int(self.db.senior_admin_id)
+                                )
+                                if not has_invite_right:
+                                    try:
+                                        self.api.messages.removeChatUser(chat_id=ctx.chat_id, member_id=invited_id)
+                                    except Exception:
+                                        pass
+                                    self.send(
+                                        ctx.peer_id,
+                                        f"⛔ {self._fmt_user(user_id)} недостаточный уровень прав на приглашение "
+                                        f"(нужна роль {req_role}+). {self._fmt_user(invited_id)} удалён из беседы.",
+                                    )
+                                    continue
                         self._ensure_member(ctx.chat_id, user_id)
                         m = self._member(ctx.chat_id, user_id)
                         if m and int(m["banned"] or 0) == 1:
@@ -5396,6 +8357,31 @@ class FactionBot:
                         if m and m["muted_until"] and int(m["muted_until"]) <= self.now_ts():
                             with self.db.conn() as c:
                                 c.execute("UPDATE chat_members SET muted_until=NULL WHERE chat_id=? AND vk_id=?", (ctx.chat_id, user_id))
+
+                        # Отправляем приветствие новому участнику если он зашёл (не вернулся)
+                        if action_type in {"chat_invite_user", "chat_invite_user_by_link"} and invited_id > 0:
+                            with self.db.conn() as c:
+                                greet = c.execute(
+                                    "SELECT text, attachment, sticker_id FROM chat_greetings WHERE chat_id=?",
+                                    (ctx.chat_id,),
+                                ).fetchone()
+                            if greet and (str(greet["text"]).strip() or str(greet["attachment"] or "").strip() or greet["sticker_id"]):
+                                greet_text = str(greet["text"] or "").strip()
+                                user_ref = self._fmt_user(invited_id)
+                                # Подставляем упоминание если есть {user} в тексте
+                                if greet_text:
+                                    greet_text = greet_text.replace("{user}", user_ref)
+                                else:
+                                    greet_text = f"👋 {user_ref}, добро пожаловать!"
+                                kwargs_g = {"peer_id": ctx.peer_id, "random_id": 0, "message": greet_text}
+                                if str(greet["attachment"] or "").strip():
+                                    kwargs_g["attachment"] = str(greet["attachment"])
+                                if greet["sticker_id"]:
+                                    kwargs_g = {"peer_id": ctx.peer_id, "random_id": 0, "sticker_id": int(greet["sticker_id"])}
+                                try:
+                                    self.api.messages.send(**kwargs_g)
+                                except Exception as e:
+                                    logger.error(f"Ошибка отправки приветствия: {e}")
 
                     if ctx.is_chat and self._enforce_chat_silence(ctx, msg.get("conversation_message_id")):
                         continue
@@ -5424,18 +8410,18 @@ class FactionBot:
                             if int(ctx.chat_id) == dst_chat and ctx.text:
                                 self.send_chat(src_chat, f"🔁 {self._fmt_user(ctx.user_id)}: {ctx.text}")
                     if ctx.text:
-                        self.handle_command(ctx)
+                        self._cmd_executor.submit(self._safe_handle_command, ctx)
             except Exception as e:
                 err = str(e)
                 if isinstance(e, requests.exceptions.ReadTimeout) or "Read timed out" in err:
-                    print("[BOT] LongPoll timeout: переподключаюсь...", file=sys.stderr)
+                    logger.info("LongPoll timeout: переподключаюсь...")
                     try:
                         self.longpoll = VkBotLongPoll(self.vk_session, self.group_id)
                     except Exception:
                         pass
                     time.sleep(1)
                     continue
-                print(f"[BOT] Ошибка цикла: {e}", file=sys.stderr)
+                logger.error(f"Ошибка цикла: {e}")
                 time.sleep(2)
 
     def telegram_listener(self) -> None:
@@ -5536,19 +8522,19 @@ def main() -> None:
 
     group_id = int(group_id_raw)
     db = DB(db_path, senior_admin_id)
-    print("[BOT] Рекомендуемый запуск в screen/tmux или через systemd с Restart=always.")
+    logger.info("Рекомендуемый запуск в screen/tmux или через systemd с Restart=always.")
     while True:
         bot = FactionBot(token=token, group_id=group_id, db=db)
         try:
             bot.run()
         except Exception as e:
-            print(f"[BOT] Критическая ошибка: {e}. Перезапуск через 5 секунд...", file=sys.stderr)
+            logger.error(f"Критическая ошибка: {e}. Перезапуск через 5 секунд...")
             time.sleep(5)
             continue
         if not bot.running:
-            print("[BOT] Остановлен вручную. Перезапуск не требуется.")
+            logger.info("Остановлен вручную. Перезапуск не требуется.")
             break
-        print("[BOT] Неожиданная остановка. Перезапуск через 5 секунд...")
+        logger.info("Неожиданная остановка. Перезапуск через 5 секунд...")
         time.sleep(5)
 
 
