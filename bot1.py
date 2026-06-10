@@ -752,6 +752,16 @@ class DB:
             )
             c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('logging_enabled','0')")
             c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('log_chat_id','0')")
+            c.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_members_chat_role
+                    ON chat_members(chat_id, role_level DESC, vk_id);
+                CREATE INDEX IF NOT EXISTS idx_users_faction_server_vk
+                    ON users(faction, server_id, vk_id);
+                CREATE INDEX IF NOT EXISTS idx_complaints_status_id
+                    ON complaints(status, id);
+                """
+            )
 
         with sqlite3.connect(ISTORIA_DB_PATH) as h:
             h.execute(
@@ -1213,19 +1223,51 @@ class FactionBot:
         return None
 
     def _fmt_user(self, user_id: int) -> str:
-        if user_id <= 0:
-            return "неизвестно"
-        cached = self.user_name_cache.get(user_id)
+        return self._fmt_users([user_id]).get(int(user_id), "неизвестно")
+
+    def _fmt_users(self, user_ids: list[int]) -> dict[int, str]:
+        """Format VK profile links using cache and batched users.get calls.
+
+        Several hot commands render many users at once. Calling users.get for every
+        user makes those commands wait on VK API rate limits/network latency; batching
+        keeps the same output format while reducing the slow path to one request per
+        100 uncached ids.
+        """
         now = self.now_ts()
-        if cached and now - cached[1] < 3600:
-            return f"[id{user_id}|{cached[0]}]"
-        try:
-            info = self.api.users.get(user_ids=str(user_id))[0]
-            full_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or f"id{user_id}"
-            self.user_name_cache[user_id] = (full_name, now)
-            return f"[id{user_id}|{full_name}]"
-        except Exception:
-            return f"[id{user_id}|id{user_id}]"
+        result: dict[int, str] = {}
+        missing: list[int] = []
+        seen: set[int] = set()
+        for raw_user_id in user_ids:
+            user_id = int(raw_user_id)
+            if user_id in seen:
+                continue
+            seen.add(user_id)
+            if user_id <= 0:
+                result[user_id] = "неизвестно"
+                continue
+            cached = self.user_name_cache.get(user_id)
+            if cached and now - cached[1] < 3600:
+                result[user_id] = f"[id{user_id}|{cached[0]}]"
+            else:
+                missing.append(user_id)
+
+        for offset in range(0, len(missing), 100):
+            chunk = missing[offset:offset + 100]
+            try:
+                users_info = self.api.users.get(user_ids=",".join(str(uid) for uid in chunk))
+                for info in users_info:
+                    uid = int(info.get("id") or 0)
+                    if uid <= 0:
+                        continue
+                    full_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or f"id{uid}"
+                    self.user_name_cache[uid] = (full_name, now)
+                    result[uid] = f"[id{uid}|{full_name}]"
+            except Exception:
+                pass
+            for uid in chunk:
+                if uid not in result:
+                    result[uid] = f"[id{uid}|id{uid}]"
+        return result
 
     def _get_setting(self, key: str, default: str = "") -> str:
         with self.db.conn() as c:
@@ -3496,8 +3538,8 @@ class FactionBot:
             ]
             reporter = self._user(ctx.user_id)
             target = self._user(int(ctx.reply_user_id))
-            reporter_name = (reporter["nickname"] if reporter and reporter["nickname"] else self._fmt_user(ctx.user_id))
-            target_name = (target["nickname"] if target and target["nickname"] else "")
+            reporter_name = reporter["nickname"] if reporter and reporter["nickname"] else ""
+            target_name = target["nickname"] if target and target["nickname"] else ""
             actor_server = int(reporter["server_id"] or 1) if reporter else 1
             with self.db.conn() as c:
                 cur = c.execute(
@@ -3516,7 +3558,13 @@ class FactionBot:
                 )
                 complaint_id = int(cur.lastrowid)
             complaint_chat_id = int(self._get_setting("complaint_chat_id", str(ctx.chat_id or 0)) or 0)
-            mentions = " ".join([self._fmt_user(uid) for uid in self._complaint_admin_mentions(complaint_chat_id, actor_server)]) if ctx.platform == "vk" else ""
+            admin_mention_ids = self._complaint_admin_mentions(complaint_chat_id, actor_server) if ctx.platform == "vk" else []
+            profile_links = self._fmt_users([int(ctx.user_id), int(ctx.reply_user_id), *admin_mention_ids])
+            if not reporter_name:
+                reporter_name = profile_links.get(int(ctx.user_id), self._platform_profile_ref(ctx.platform, ctx.user_id))
+            if not target_name:
+                target_name = profile_links.get(int(ctx.reply_user_id), "")
+            mentions = " ".join(profile_links[uid] for uid in admin_mention_ids if uid in profile_links)
             notify_lines = [
                 f"⚠️ Поступила новая жалоба #{complaint_id}.",
                 f"1. Заявитель: {reporter_name}, {self._platform_profile_ref(ctx.platform, ctx.user_id)}",
@@ -4139,10 +4187,11 @@ class FactionBot:
             if not rows:
                 self.send(ctx.peer_id, "📋 В чате 0 людей с должностью выше одобренного пользователя.")
                 return
+            formatted_users = self._fmt_users([int(r["vk_id"]) for r in rows])
             grouped: dict[str, list[str]] = {}
             for r in rows:
                 role_label = f"{r['name'] or 'Роль'} ({int(r['role_level'])})"
-                grouped.setdefault(role_label, []).append(self._fmt_user(int(r["vk_id"])))
+                grouped.setdefault(role_label, []).append(formatted_users.get(int(r["vk_id"]), f"[id{int(r['vk_id'])}|id{int(r['vk_id'])}]"))
             lines = [f"📋 В чате {len(rows)} людей с должностью выше одобренного пользователя:"]
             for role_label, users in grouped.items():
                 lines.append(f"• {role_label}: {', '.join(users)}")
