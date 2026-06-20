@@ -11,8 +11,6 @@ VK Community Faction Bot (single-file edition)
   SENIOR_ADMIN_ID=576521317
 """
 
-from __future__ import annotations
-
 import os
 import re
 import signal
@@ -32,6 +30,7 @@ from typing import Optional
 
 import logging
 import hashlib
+import hmac
 from logging.handlers import RotatingFileHandler
 
 import vk_api
@@ -60,10 +59,12 @@ MAFIA_FACTIONS = {"Красная Мафия", "Розовая Мафия"}
 DEFAULT_ROLE_NAME = "Одобренный пользователь"
 DEFAULT_LIMIT_PER_MIN = 100
 
-CONTROL_PIPE_PATH = "/tmp/vk_bot_control.pipe"
-MSK_TZ = timezone(timedelta(hours=3), name="MSK")
-TG_SENIOR_ADMIN_USERNAME = os.getenv("TG_SENIOR_ADMIN_USERNAME", "senior_admin").strip().lstrip("@").lower()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONTROL_PIPE_PATH = os.getenv("CONTROL_PIPE_PATH", os.path.join(BASE_DIR, "vk_bot_control.pipe"))
+CONTROL_PIPE_ENABLED = os.getenv("CONTROL_PIPE_ENABLED", "0").strip() == "1"
+MSK_TZ = timezone(timedelta(hours=3), name="MSK")
+TG_SENIOR_ADMIN_USERNAME = os.getenv("TG_SENIOR_ADMIN_USERNAME", "").strip().lstrip("@").lower()
+TG_SENIOR_ADMIN_ID = int(os.getenv("TG_SENIOR_ADMIN_ID", "0") or "0")
 
 def _make_logger() -> logging.Logger:
     log = logging.getLogger("bot")
@@ -93,14 +94,56 @@ logger = _make_logger()
 DEFAULT_DB_PATH = os.path.join(BASE_DIR, "bot.db")
 ISTORIA_DB_PATH = os.path.join(BASE_DIR, "istoria.db")
 LISTS_DB_PATH = os.path.join(BASE_DIR, "lists.db")
+SUBSCRIPTIONS_DB_PATH = os.path.join(BASE_DIR, "subscriptions.db")
 # ENCRYPTION_KEY_A/B are set below with validation
+
+def _derive_secure_key(key_a: str, key_b: str) -> bytes:
+    return hashlib.sha256(f"{key_a}:{key_b}".encode("utf-8")).digest()
+
+def _secure_keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        out.extend(hashlib.sha256(key + nonce + counter.to_bytes(8, "big")).digest())
+        counter += 1
+    return bytes(out[:length])
+
+def _secure_encrypt_text(text: str, key_a: str, key_b: str) -> str:
+    raw = text.encode("utf-8")
+    key = _derive_secure_key(key_a, key_b)
+    nonce = os.urandom(16)
+    stream = _secure_keystream(key, nonce, len(raw))
+    cipher = bytes(x ^ y for x, y in zip(raw, stream))
+    tag = hmac.new(key, nonce + cipher, hashlib.sha256).digest()[:16]
+    token = base64.urlsafe_b64encode(nonce + cipher + tag).decode("ascii")
+    return "v2:" + token
+
+def _secure_decrypt_text(token: str, key_a: str, key_b: str) -> Optional[str]:
+    if not token.startswith("v2:"):
+        return None
+    try:
+        blob = base64.urlsafe_b64decode(token[3:].encode("ascii"))
+        if len(blob) < 32:
+            return ""
+        nonce = blob[:16]
+        tag = blob[-16:]
+        cipher = blob[16:-16]
+        key = _derive_secure_key(key_a, key_b)
+        expected = hmac.new(key, nonce + cipher, hashlib.sha256).digest()[:16]
+        if not hmac.compare_digest(tag, expected):
+            return ""
+        stream = _secure_keystream(key, nonce, len(cipher))
+        raw = bytes(x ^ y for x, y in zip(cipher, stream))
+        return raw.decode("utf-8")
+    except Exception:
+        return ""
 
 TG_PEER_SHIFT = 10_000_000_000_000
 PRIVACY_POLICY_URL = os.getenv("PRIVACY_POLICY_URL", "https://vk.ru/@pulse_rwpe-politika-konfedencialnosti").strip()
 
 # ---------------------------- Быстрые настройки версии ----------------------------
 # Для тестового стенда достаточно поменять эти 2 строки:
-BOT_VERSION = "02.06.2026 8:31(МСК)"
+BOT_VERSION = "11.06.2026 5:27(МСК)"
 BOT_DB_PATH_CONFIG = os.path.join(BASE_DIR, "bot.db")
 # Backward-compat alias for legacy typo in some deployments/scripts.
 BOT_DB_PATH_CONIG = BOT_DB_PATH_CONFIG
@@ -112,6 +155,11 @@ load_dotenv()
 # Все секреты берутся из переменных окружения
 HARDCODED_GROUP_TOKEN = os.getenv("VK_GROUP_TOKEN", "")
 HARDCODED_GROUP_ID = int(os.getenv("VK_GROUP_ID", "0"))
+WALL_READ_TOKEN = (
+    os.getenv("VK_WALL_TOKEN", "").strip()
+    or os.getenv("VK_USER_TOKEN", "").strip()
+    or os.getenv("VK_SERVICE_TOKEN", "").strip()
+)
 _key_a = os.getenv("BOT_KEY_A", "").strip()
 _key_b = os.getenv("BOT_KEY_B", "").strip()
 if not _key_a or not _key_b:
@@ -203,12 +251,19 @@ COMMAND_ACCESS: dict[str, dict[str, int]] = {
     "!логи": {"user_default": 0, "admin_default": 0},
     "!жалоба": {"user_default": 0, "admin_default": 0},
     "!жалобы": {"user_default": 0, "admin_default": 0},
+    "!рассмотрение": {"user_default": 0, "admin_default": 0},
+    "!одобрить": {"user_default": 0, "admin_default": 0},
+    "!отказать": {"user_default": 0, "admin_default": 0},
     "!принять": {"user_default": 0, "admin_default": 0},
     "!отклонить": {"user_default": 0, "admin_default": 0},
     "!оффадминувед": {"user_default": 0, "admin_default": 0},
     "!админувед": {"user_default": 0, "admin_default": 0},
     "!дубль": {"user_default": 0, "admin_default": 0},
     "!одобритьдубль": {"user_default": 0, "admin_default": 0},
+    "!новая подписка": {"user_default": 70, "admin_default": 40},
+    "!подписка": {"user_default": 70, "admin_default": 40},
+    "!подписки": {"user_default": 0, "admin_default": 0},
+    "!отписаться": {"user_default": 70, "admin_default": 40},
     "!права": {"user_default": 0, "admin_default": 0},
     "!роли": {"user_default": 0, "admin_default": 0},
     "!создать": {"user_default": 70, "admin_default": 0},
@@ -256,7 +311,8 @@ COMMAND_ACCESS: dict[str, dict[str, int]] = {
     "!снять роль": {"user_default": 70, "admin_default": 0},
     "!создать роль": {"user_default": 70, "admin_default": 0},
     "!список чс": {"user_default": 0, "admin_default": 10},
-    "!список выговоров": {"user_default": 0, "admin_default": 5},
+    "!список выговоров": {"user_default": 0, "admin_default": 0},
+    "!выговоры": {"user_default": 0, "admin_default": 0},
     "!список допрассм": {"user_default": 0, "admin_default": 100},
     "!право админ": {"user_default": 0, "admin_default": 100},
     "!синхроль": {"user_default": 0, "admin_default": 70},
@@ -463,12 +519,16 @@ COMMAND_USAGE: dict[str, str] = {
     "!ботразбан": "!ботразбан (пользователь)",
     "!жалоба": "!жалоба (reply на сообщение)",
     "!жалобы": "!жалобы",
-    "!принять": "!принять жалобу (номер)",
-    "!отклонить": "!отклонить жалобу (номер)",
+    "!рассмотрение": "!рассмотрение (номер жалобы) или ответом на сообщение жалобы",
+    "!одобрить": "!одобрить (номер заявки)",
+    "!отказать": "!отказать (номер заявки)",
+    "!принять": "!принять (номер жалобы) или ответом на сообщение жалобы",
+    "!отклонить": "!отклонить (номер жалобы) или ответом на сообщение жалобы",
     "!оффадминувед": "!оффадминувед (пользователь)",
     "!админувед": "!админувед (пользователь)",
     "!дубль": "!дубль (ник)",
     "!одобритьдубль": "!одобритьдубль (номер)",
+    "!подписка": "!подписка пинг вкл / !подписка пинг выкл",
     "!право": "!право (команда) (уровень роли)",
     "!команда": "!команда - !команда (уровень) / !команда + !команда",
     "!админправо": "!админправо (команда) (уровень админ прав)",
@@ -487,6 +547,9 @@ COMMAND_USAGE: dict[str, str] = {
     "!инфа": "!инфа (пользователь)",
     "!удалитьинфу": "!удалить инфу (пользователь) (номер)",
     "!облик": "!облик 0 (пользователь)",
+    "!новая подписка": "!новая подписка (ссылка на сообщество)",
+    "!подписки": "!подписки",
+    "!отписаться": "!отписаться (ссылка на сообщество)",
     "!проверкачата": "!проверкачата (номер чата)",
     "!удаленный": "!удаленный доступ (номер чата) / !удаленный доступ стоп",
     "!чат": "!чат фракции (фракция) (сервер 1..3)",
@@ -535,6 +598,19 @@ COMMAND_REQUIRED_ARGS: dict[str, list[str]] = {
 COMMAND_COOLDOWNS: dict[str, int] = {k: 1 for k in COMMAND_ACCESS.keys()}
 COMMAND_COOLDOWNS["!я"] = 180
 COMMAND_COOLDOWNS["!дубль"] = 86400
+
+CHAT_ONLY_COMMANDS = {
+    "!бан", "!кик", "!разбан", "!мут", "!размут", "!роли", "!создать", "!создать роль",
+    "!роль", "!снять", "!снять роль", "!переименовать", "!пуш", "!банлист", "!мутлист",
+    "!новоеприветствие", "!новое приветствие", "!удалитьприветствие", "!удалить приветствие",
+    "!заметка", "!заметки", "!иммунитет", "!снятьиммунитет", "!иммунитеты", "!право",
+    "!пред", "!повысить", "!понизить", "!админы", "!снятьпред", "!списокпредов",
+    "!выговор", "!список", "!список выговоров", "!выговоры", "!тишина", "!снятьтишину",
+    "!голос", "!приглос", "!проверкачата", "!удаленный", "!новая подписка", "!подписки", "!отписаться",
+}
+
+WIPE_SESSION_TTL_SEC = 300
+REMOTE_ACCESS_TTL_SEC = 1800
 
 
 
@@ -809,6 +885,8 @@ class DB:
                     attachments TEXT,
                     status TEXT NOT NULL DEFAULT 'open',
                     created_at INTEGER NOT NULL,
+                    review_by INTEGER,
+                    review_at INTEGER,
                     closed_by INTEGER,
                     closed_at INTEGER
                 );
@@ -950,7 +1028,20 @@ class DB:
                     PRIMARY KEY(chat_id, vk_id, role_name)
                 );
 
-                
+                CREATE TABLE IF NOT EXISTS chat_command_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    vk_id INTEGER NOT NULL,
+                    command TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_complaints_status_id ON complaints(status, id);
+                CREATE INDEX IF NOT EXISTS idx_chat_command_logs_chat_id ON chat_command_logs(chat_id, id);
+                CREATE INDEX IF NOT EXISTS idx_chat_members_chat_role ON chat_members(chat_id, role_level DESC);
+                CREATE INDEX IF NOT EXISTS idx_users_faction_server ON users(faction, server_id);
+
+
                 """
             )
             try:
@@ -1028,6 +1119,14 @@ class DB:
             c.execute("UPDATE faction_strikes SET server_id=1 WHERE server_id IS NULL OR server_id<1 OR server_id>3")
             try:
                 c.execute("ALTER TABLE notes ADD COLUMN attachments TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE complaints ADD COLUMN review_by INTEGER")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE complaints ADD COLUMN review_at INTEGER")
             except sqlite3.OperationalError:
                 pass
             try:
@@ -1187,9 +1286,12 @@ class Ctx:
     reply_user_id: Optional[int] = None
     reply_text: Optional[str] = None
     message_cmid: Optional[int] = None
+    message_id: Optional[int] = None
     reply_cmid: Optional[int] = None
+    reply_message_id: Optional[int] = None
     reply_attachments: Optional[list[str]] = None
     reply_attachment_ids: Optional[list[str]] = None
+    reply_link_urls: Optional[list[str]] = None
     platform: str = "vk"
     tg_is_chat: bool = False
     tg_username: Optional[str] = None
@@ -1230,14 +1332,14 @@ class ListsDB:
         return bytes(b ^ k[i % len(k)] for i, b in enumerate(data))
 
     def _encrypt(self, text: str) -> str:
-        """Двойное XOR + base64url шифрование содержимого."""
-        raw = text.encode("utf-8")
-        step1 = self._xor_bytes(raw, self._key_a)
-        step2 = self._xor_bytes(step1, self._key_b)
-        return base64.urlsafe_b64encode(step2).decode("ascii")
+        """Версионированное шифрование содержимого; старый XOR оставлен только для чтения."""
+        return _secure_encrypt_text(text, self._key_a, self._key_b)
 
     def _decrypt(self, token: str) -> str:
         """Обратное декодирование."""
+        secure = _secure_decrypt_text(token, self._key_a, self._key_b)
+        if secure is not None:
+            return secure
         try:
             b = base64.urlsafe_b64decode(token.encode("ascii"))
             step1 = self._xor_bytes(b, self._key_b)
@@ -1428,12 +1530,125 @@ class ListsDB:
         return [dict(r) for r in rows]
 
 
+class CommunitySubscriptionsDB:
+    def __init__(self, path: str, key_a: str, key_b: str) -> None:
+        self.path = path
+        self._key_a = key_a
+        self._key_b = key_b
+        self._init()
+
+    def _encrypt(self, text: str) -> str:
+        return _secure_encrypt_text(text, self._key_a, self._key_b)
+
+    def _decrypt(self, token: str) -> str:
+        secure = _secure_decrypt_text(token or "", self._key_a, self._key_b)
+        return secure if secure is not None else str(token or "")
+
+    def conn(self) -> sqlite3.Connection:
+        c = sqlite3.connect(self.path, timeout=10)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA trusted_schema=OFF")
+        return c
+
+    def _init(self) -> None:
+        with self.conn() as c:
+            c.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS chat_subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    owner_id INTEGER NOT NULL,
+                    domain_enc TEXT NOT NULL,
+                    title_enc TEXT NOT NULL,
+                    url_enc TEXT NOT NULL,
+                    last_post_id INTEGER NOT NULL DEFAULT 0,
+                    ping_all INTEGER NOT NULL DEFAULT 0,
+                    created_by INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(chat_id, owner_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_subscriptions_owner ON chat_subscriptions(owner_id);
+                CREATE INDEX IF NOT EXISTS idx_chat_subscriptions_chat ON chat_subscriptions(chat_id);
+                """
+            )
+            try:
+                c.execute("ALTER TABLE chat_subscriptions ADD COLUMN ping_all INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+
+    def add_subscription(self, chat_id: int, owner_id: int, domain: str, title: str, url: str, created_by: int, created_at: int, last_post_id: int) -> bool:
+        with self.conn() as c:
+            cur = c.execute(
+                """
+                INSERT OR IGNORE INTO chat_subscriptions
+                (chat_id,owner_id,domain_enc,title_enc,url_enc,last_post_id,created_by,created_at)
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(chat_id),
+                    int(owner_id),
+                    self._encrypt(domain),
+                    self._encrypt(title),
+                    self._encrypt(url),
+                    int(last_post_id),
+                    int(created_by),
+                    int(created_at),
+                ),
+            )
+            return cur.rowcount > 0
+
+    def remove_subscription(self, chat_id: int, owner_id: int) -> bool:
+        with self.conn() as c:
+            cur = c.execute("DELETE FROM chat_subscriptions WHERE chat_id=? AND owner_id=?", (int(chat_id), int(owner_id)))
+            return cur.rowcount > 0
+
+    def list_chat(self, chat_id: int) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute("SELECT * FROM chat_subscriptions WHERE chat_id=? ORDER BY id", (int(chat_id),)).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def list_all(self) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute("SELECT * FROM chat_subscriptions ORDER BY owner_id, chat_id").fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def update_last_post(self, sub_id: int, last_post_id: int) -> None:
+        with self.conn() as c:
+            c.execute("UPDATE chat_subscriptions SET last_post_id=? WHERE id=?", (int(last_post_id), int(sub_id)))
+
+    def set_chat_ping_all(self, chat_id: int, enabled: bool) -> int:
+        with self.conn() as c:
+            cur = c.execute(
+                "UPDATE chat_subscriptions SET ping_all=? WHERE chat_id=?",
+                (1 if enabled else 0, int(chat_id)),
+            )
+            return int(cur.rowcount or 0)
+
+    def _row_to_dict(self, row: sqlite3.Row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "chat_id": int(row["chat_id"]),
+            "owner_id": int(row["owner_id"]),
+            "domain": self._decrypt(row["domain_enc"]),
+            "title": self._decrypt(row["title_enc"]),
+            "url": self._decrypt(row["url_enc"]),
+            "last_post_id": int(row["last_post_id"] or 0),
+            "ping_all": int(row["ping_all"] or 0),
+            "created_by": int(row["created_by"]),
+            "created_at": int(row["created_at"]),
+        }
+
+
 class FactionBot:
     def __init__(self, token: str, group_id: int, db: DB):
         self.db = db
         self.group_id = group_id
         self.vk_session = vk_api.VkApi(token=token)
         self.api = self.vk_session.get_api()
+        self.wall_api = vk_api.VkApi(token=WALL_READ_TOKEN).get_api() if WALL_READ_TOKEN else None
+        self._wall_token_missing_logged = False
         self.longpoll = VkBotLongPoll(self.vk_session, group_id)
         self.running = True
         self.rate: dict[int, deque[float]] = defaultdict(deque)
@@ -1451,14 +1666,21 @@ class FactionBot:
         self.command_last_run: dict[tuple[int, str], int] = {}
         self._int_setting_cache: dict[str, tuple[int, int]] = {}
         self.silence_window: dict[tuple[int, int], deque[int]] = defaultdict(deque)
+        self.silence_spam_window: dict[tuple[int, int], deque[int]] = defaultdict(deque)
         self.chat_command_history: dict[int, deque[tuple[int, str, int]]] = defaultdict(lambda: deque(maxlen=200))
         self._current_user_for_parse: Optional[int] = None
         self.tg_senior_admin_runtime_id: Optional[int] = None
         # Пул потоков для параллельного выполнения команд
         self._cmd_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="cmd")
+        self._cmd_queue_slots = threading.BoundedSemaphore(128)
         # Инициализация БД списков
         self.lists_db = ListsDB(
             path=LISTS_DB_PATH,
+            key_a=ENCRYPTION_KEY_A,
+            key_b=ENCRYPTION_KEY_B,
+        )
+        self.subscriptions_db = CommunitySubscriptionsDB(
+            path=SUBSCRIPTIONS_DB_PATH,
             key_a=ENCRYPTION_KEY_A,
             key_b=ENCRYPTION_KEY_B,
         )
@@ -1480,12 +1702,12 @@ class FactionBot:
             return ("tg", tg_chat_id)
         return ("vk", peer_id)
 
-    def send(self, peer_id: int, text: str) -> None:
+    def send(self, peer_id: int, text: str, disable_mentions: int = 1) -> None:
         route = self._resolve_route(peer_id)
         if route[0] == "tg":
             self._send_tg(route[1], text)
         else:
-            self.api.messages.send(peer_id=peer_id, random_id=0, message=text, disable_mentions=1)
+            self.api.messages.send(peer_id=peer_id, random_id=0, message=text, disable_mentions=disable_mentions)
         self._log_command_response(peer_id, text)
 
     def send_with_keyboard(self, peer_id: int, text: str, buttons: list[list[str]]) -> None:
@@ -1503,15 +1725,81 @@ class FactionBot:
         )
         self._log_command_response(peer_id, text)
 
-    def send_with_attachments(self, peer_id: int, text: str, attachments: list[str]) -> None:
+    def send_with_attachments(self, peer_id: int, text: str, attachments: list[str], disable_mentions: int = 1) -> None:
         route = self._resolve_route(peer_id)
         if route[0] == "tg":
             self._send_tg(route[1], text)
             return
-        params = {"peer_id": peer_id, "random_id": 0, "message": text, "disable_mentions": 1}
-        if attachments:
-            params["attachment"] = ",".join(attachments)
-        self.api.messages.send(**params)
+        clean_attachments = [str(a) for a in attachments or [] if str(a).strip()]
+        chunks = [clean_attachments[i:i + 10] for i in range(0, len(clean_attachments), 10)] or [[]]
+        for idx, chunk in enumerate(chunks):
+            params = {
+                "peer_id": peer_id,
+                "random_id": random.randint(1, 2_147_483_647),
+                "message": text if idx == 0 else "📎 Вложения к сообщению выше",
+                "disable_mentions": disable_mentions,
+            }
+            if chunk:
+                params["attachment"] = ",".join(chunk)
+            try:
+                self.api.messages.send(**params)
+            except Exception as e:
+                logger.error(f"send_with_attachments chunk failed: {e}; attachments={chunk}")
+                if idx == 0:
+                    self.api.messages.send(
+                        peer_id=peer_id,
+                        random_id=random.randint(1, 2_147_483_647),
+                        message=text,
+                        disable_mentions=disable_mentions,
+                    )
+                for one in chunk:
+                    try:
+                        self.api.messages.send(
+                            peer_id=peer_id,
+                            random_id=random.randint(1, 2_147_483_647),
+                            message="📎 Вложение к сообщению выше",
+                            attachment=one,
+                            disable_mentions=disable_mentions,
+                        )
+                    except Exception as one_e:
+                        logger.error(f"send single attachment failed: {one_e}; attachment={one}")
+        self._log_command_response(peer_id, text)
+
+    def send_with_forwarded_message(
+        self,
+        peer_id: int,
+        text: str,
+        forward_message_ids: list[int],
+        attachments: Optional[list[str]] = None,
+    ) -> None:
+        route = self._resolve_route(peer_id)
+        if route[0] == "tg":
+            self._send_tg(route[1], text)
+            return
+        sent_forward = False
+        ids = [str(int(x)) for x in forward_message_ids or [] if x]
+        clean_attachments = [str(a) for a in attachments or [] if str(a).strip()]
+        if ids:
+            try:
+                params = {
+                    "peer_id": peer_id,
+                    "random_id": random.randint(1, 2_147_483_647),
+                    "message": text,
+                    "forward_messages": ",".join(ids),
+                    "disable_mentions": 1,
+                }
+                if clean_attachments and len(clean_attachments) <= 10:
+                    params["attachment"] = ",".join(clean_attachments)
+                self.api.messages.send(**params)
+                sent_forward = True
+            except Exception as e:
+                logger.error(f"forward complaint message failed: {e}; ids={ids}")
+        if clean_attachments and not sent_forward:
+            self.send_with_attachments(peer_id, text, clean_attachments)
+        elif not sent_forward:
+            self.send(peer_id, text)
+        elif clean_attachments and len(clean_attachments) > 10:
+            self.send_with_attachments(peer_id, "📎 Дополнительные вложения к жалобе", clean_attachments[10:])
         self._log_command_response(peer_id, text)
 
     def send_ephemeral(self, peer_id: int, text: str, ttl_sec: int = 5) -> None:
@@ -1563,7 +1851,40 @@ class FactionBot:
         if self._is_oblik_user(ctx.user_id):
             return
         cmd_name = text.split()[0].strip().lower()
-        self.chat_command_history[ctx.chat_id].append((ctx.user_id, cmd_name, self.now_ts()))
+        if cmd_name == "!я":
+            return
+        now = self.now_ts()
+        with self.db.conn() as c:
+            c.execute(
+                "INSERT INTO chat_command_logs(chat_id,vk_id,command,created_at) VALUES(?,?,?,?)",
+                (int(ctx.chat_id), int(ctx.user_id), cmd_name, now),
+            )
+            c.execute(
+                """
+                DELETE FROM chat_command_logs
+                WHERE chat_id=? AND id NOT IN (
+                    SELECT id FROM chat_command_logs
+                    WHERE chat_id=?
+                    ORDER BY id DESC
+                    LIMIT 200
+                )
+                """,
+                (int(ctx.chat_id), int(ctx.chat_id)),
+            )
+
+    def _last_chat_command_logs(self, chat_id: int, limit: int = 20) -> list[dict]:
+        with self.db.conn() as c:
+            rows = c.execute(
+                """
+                SELECT vk_id,command,created_at
+                FROM chat_command_logs
+                WHERE chat_id=?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(chat_id), int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     @staticmethod
     def _keyboard(buttons: list[list[str]]) -> str:
@@ -1650,7 +1971,9 @@ class FactionBot:
     def _is_senior_admin_ctx(self, ctx: Ctx) -> bool:
         if ctx.platform == "tg":
             uname = (ctx.tg_username or "").strip().lstrip("@").lower()
-            if uname and uname == TG_SENIOR_ADMIN_USERNAME:
+            if TG_SENIOR_ADMIN_ID > 0 and int(ctx.user_id) == TG_SENIOR_ADMIN_ID:
+                return True
+            if TG_SENIOR_ADMIN_USERNAME and uname and uname == TG_SENIOR_ADMIN_USERNAME:
                 return True
             return self.tg_senior_admin_runtime_id is not None and int(ctx.user_id) == int(self.tg_senior_admin_runtime_id)
         return int(ctx.user_id) == int(self.db.senior_admin_id)
@@ -1877,20 +2200,93 @@ class FactionBot:
                 return int(row["vk_id"])
         return None
 
-    def _fmt_user(self, user_id: int) -> str:
+    def _fmt_user_ref(self, user_id: int, name: Optional[str] = None) -> str:
         if user_id <= 0:
             return "неизвестно"
-        cached = self.user_name_cache.get(user_id)
-        now = self.now_ts()
-        if cached and now - cached[1] < 3600:
-            return f"[id{user_id}|{cached[0]}]"
+        safe_name = (name or f"id{user_id}").strip() or f"id{user_id}"
+        safe_name = safe_name.replace("[", "(").replace("]", ")").replace("|", "¦")
+        return f"[id{user_id}|{safe_name}]"
+
+    def _fmt_user(self, user_id: int) -> str:
         try:
-            info = self.api.users.get(user_ids=str(user_id))[0]
-            full_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or f"id{user_id}"
-            self.user_name_cache[user_id] = (full_name, now)
-            return f"[id{user_id}|{full_name}]"
-        except Exception:
-            return f"[id{user_id}|id{user_id}]"
+            uid = int(user_id)
+        except (TypeError, ValueError):
+            return "неизвестно"
+        return self._fmt_users_bulk([uid]).get(uid, "неизвестно")
+
+    def _fmt_users_bulk(self, user_ids: list[int] | tuple[int, ...] | set[int]) -> dict[int, str]:
+        """Форматирует пользователей пачкой, чтобы списковые команды не делали VK API запрос на каждую строку."""
+        now = self.now_ts()
+        ids: list[int] = []
+        seen: set[int] = set()
+        for raw_uid in user_ids:
+            try:
+                uid = int(raw_uid)
+            except (TypeError, ValueError):
+                continue
+            if uid <= 0 or uid in seen:
+                continue
+            seen.add(uid)
+            ids.append(uid)
+
+        formatted: dict[int, str] = {}
+        missing: list[int] = []
+        for uid in ids:
+            cached = self.user_name_cache.get(uid)
+            if cached and now - cached[1] < 3600:
+                formatted[uid] = self._fmt_user_ref(uid, cached[0])
+            else:
+                missing.append(uid)
+
+        # VK users.get принимает список id, поэтому забираем имена пачками вместо десятков
+        # последовательных сетевых запросов. Это особенно ускоряет !жалобы и !админы.
+        for i in range(0, len(missing), 500):
+            chunk = missing[i:i + 500]
+            try:
+                infos = self.api.users.get(user_ids=",".join(str(uid) for uid in chunk))
+            except Exception:
+                infos = []
+            for info in infos or []:
+                try:
+                    uid = int(info.get("id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if uid <= 0:
+                    continue
+                full_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or f"id{uid}"
+                self.user_name_cache[uid] = (full_name, now)
+                formatted[uid] = self._fmt_user_ref(uid, full_name)
+
+        for uid in ids:
+            formatted.setdefault(uid, self._fmt_user_ref(uid))
+        return formatted
+
+    def _send_long_text(self, peer_id: int, text: str, max_len: int = 3500) -> None:
+        """Безопасно отправляет длинный ответ несколькими сообщениями, не теряя строки."""
+        text = str(text or "")
+        if len(text) <= max_len:
+            self.send(peer_id, text)
+            return
+        part_lines: list[str] = []
+        part_len = 0
+        for line in text.splitlines():
+            extra = len(line) + (1 if part_lines else 0)
+            if part_lines and part_len + extra > max_len:
+                self.send(peer_id, "\n".join(part_lines))
+                part_lines = []
+                part_len = 0
+            if len(line) > max_len:
+                while len(line) > max_len:
+                    if part_lines:
+                        self.send(peer_id, "\n".join(part_lines))
+                        part_lines = []
+                        part_len = 0
+                    self.send(peer_id, line[:max_len])
+                    line = line[max_len:]
+            part_lines.append(line)
+            part_len += len(line) + (1 if part_len else 0)
+        if part_lines:
+            self.send(peer_id, "\n".join(part_lines))
 
     def _get_setting(self, key: str, default: str = "") -> str:
         with self.db.conn() as c:
@@ -2065,17 +2461,9 @@ class FactionBot:
     def _is_immune_to_silence(self, user_id: int, chat_id: int) -> bool:
         """Проверяет иммунитет к режиму тишины.
         Иммунитет имеют:
-          1. Фракция Админ
-          2. Лидер фракции чата
-          3. Пользователи с admin_level >= silence_admin_threshold (настраивается через !тишина админпорог)
-          4. Пользователи, добавленные в silence_exceptions для этого чата (временный голос)
+          1. Пользователи с admin_level >= silence_admin_threshold (настраивается через !тишина админпорог)
+          2. Пользователи, добавленные в silence_exceptions для этого чата (временный голос)
         """
-        # Фракция Админ — всегда иммунитет
-        if self._is_admin_faction_user(user_id):
-            return True
-        # Лидер фракции в этом чате — всегда иммунитет
-        if self._is_leader_for_chat_faction(user_id, chat_id):
-            return True
         # Динамический порог из настроек (по умолчанию 40)
         threshold = self._get_silence_admin_threshold()
         if threshold > 0 and self._get_admin_level(user_id) >= threshold:
@@ -2086,7 +2474,7 @@ class FactionBot:
         if not ctx.is_chat:
             return False
 
-        # Постоянный иммунитет (фракция Админ, лидеры, высокий admin_level >= порог)
+        # Постоянный иммунитет по admin_level >= порог
         if self._is_immune_to_silence(ctx.user_id, ctx.chat_id):
             return False
 
@@ -2114,6 +2502,10 @@ class FactionBot:
         window_sec = int(rule["window_min"]) * 60
         limit = int(rule["msg_limit"])
         key = (ctx.chat_id, ctx.user_id)
+        spam_dq = self.silence_spam_window[key]
+        while spam_dq and now - spam_dq[0] > 60:
+            spam_dq.popleft()
+        spam_dq.append(now)
         dq = self.silence_window[key]
         while dq and now - dq[0] > window_sec:
             dq.popleft()
@@ -2123,6 +2515,38 @@ class FactionBot:
                     "messages.delete",
                     {"peer_id": ctx.peer_id, "cmids": str(conversation_message_id), "delete_for_all": 1},
                 )
+            if len(spam_dq) > 10:
+                until = now + 3600
+                already_muted = False
+                with self.db.conn() as c:
+                    c.execute(
+                        "INSERT OR IGNORE INTO chat_members(chat_id,vk_id) VALUES(?,?)",
+                        (ctx.chat_id, ctx.user_id),
+                    )
+                    muted = c.execute(
+                        "SELECT muted_until FROM chat_members WHERE chat_id=? AND vk_id=?",
+                        (ctx.chat_id, ctx.user_id),
+                    ).fetchone()
+                    already_muted = bool(muted and int(muted["muted_until"] or 0) > now)
+                    if not already_muted:
+                        c.execute(
+                            "UPDATE chat_members SET muted_until=? WHERE chat_id=? AND vk_id=?",
+                            (until, ctx.chat_id, ctx.user_id),
+                        )
+                        c.execute(
+                            "INSERT INTO mute_logs(chat_id,vk_id,issuer_id,reason,created_at,until_ts,active) "
+                            "VALUES(?,?,?,?,?,?,1)",
+                            (ctx.chat_id, ctx.user_id, 0, "Спам в режиме тишины", now, until),
+                        )
+                if not already_muted:
+                    try:
+                        self._apply_vk_mute(ctx.peer_id, ctx.user_id, 3600)
+                    except Exception:
+                        pass
+                    self.send(
+                        ctx.peer_id,
+                        f"Пользователю {self._fmt_user(ctx.user_id)} выдан мут, причина: Спам в режиме тишины",
+                    )
             return True
         dq.append(now)
         return False
@@ -2131,6 +2555,10 @@ class FactionBot:
         if self._logging_in_progress or not self._active_command:
             return
         actor_id, cmd_text, origin_peer_id = self._active_command
+        cmd_name = cmd_text.split()[0].strip().lower() if cmd_text.split() else ""
+        if cmd_name == "!я":
+            self._active_command = None
+            return
         if self._is_oblik_user(actor_id):
             self._active_command = None
             return
@@ -2173,12 +2601,12 @@ class FactionBot:
         return bytes(b ^ k[i % len(k)] for i, b in enumerate(data))
 
     def _double_encrypt(self, text: str) -> str:
-        b = text.encode("utf-8")
-        step1 = self._xor_bytes(b, ENCRYPTION_KEY_A)
-        step2 = self._xor_bytes(step1, ENCRYPTION_KEY_B)
-        return base64.urlsafe_b64encode(step2).decode("ascii")
+        return _secure_encrypt_text(text, ENCRYPTION_KEY_A, ENCRYPTION_KEY_B)
 
     def _double_decrypt(self, token: str) -> str:
+        secure = _secure_decrypt_text(token, ENCRYPTION_KEY_A, ENCRYPTION_KEY_B)
+        if secure is not None:
+            return secure
         try:
             b = base64.urlsafe_b64decode(token.encode("ascii"))
             step1 = self._xor_bytes(b, ENCRYPTION_KEY_B)
@@ -2262,13 +2690,9 @@ class FactionBot:
             "!изменить": 4,
             "!выговор": 3,
             "!супербан": 3,
-            "!принять": 3,
-            "!отклонить": 3,
             "!оффадминувед": 2,
             "!админувед": 2,
             "!рейтинг": 4,
-            "!принять": 3,
-            "!отклонить": 3,
             "!админправо": 3,
             "!закладка": 2,
             "!дубль": 2,
@@ -2440,6 +2864,8 @@ class FactionBot:
         if self._is_bot_banned(ctx.user_id):
             return False
         cmd_norm = self._normalize_command_name(cmd)
+        if not ctx.is_chat and cmd_norm in CHAT_ONLY_COMMANDS:
+            return False
         # Персональные запреты/разрешения — один запрос
         with self.db.conn() as c:
             denied = c.execute(
@@ -2447,13 +2873,11 @@ class FactionBot:
                 (ctx.user_id, cmd_norm),
             ).fetchone()
             allowed = c.execute(
-                "SELECT 1 FROM user_cmd_allow WHERE target_vk_id=? AND LOWER(command)=LOWER(?)",
+                "SELECT granted_by FROM user_cmd_allow WHERE target_vk_id=? AND LOWER(command)=LOWER(?)",
                 (ctx.user_id, cmd_norm),
             ).fetchone()
         if denied:
             return False
-        if allowed:
-            return True
         if ctx.is_chat:
             with self.db.conn() as c:
                 off = c.execute(
@@ -2470,11 +2894,23 @@ class FactionBot:
             return admin_lvl >= 50 or (5 <= admin_lvl <= 10)
         if cmd == "!чат" and ctx.is_chat and self._is_leader_user(ctx.user_id):
             return True
+        # Лидер фракции имеет полный доступ к управлению ролями (выдача/снятие/создание/
+        # удаление/переименование роли, список ролей) в чате своей фракции, независимо
+        # от его текущей роли в этом чате.
+        if ctx.is_chat and self._is_role_management_command(cmd, ctx.text):
+            if self._is_leader_for_chat_faction(ctx.user_id, ctx.chat_id):
+                return True
 
         # ── Вычисляем effective_admin_min ─────────────────────────────────────
         # Использует _get_effective_admin_min: учитывает !админправо + код + ADMIN_MIN
         # !админправо имеет наивысший приоритет и может менять порог в любую сторону.
         effective_admin_min = self._get_effective_admin_min(cmd)
+        if allowed:
+            if effective_admin_min <= 0:
+                return True
+            granter_id = int(allowed["granted_by"] or 0)
+            if granter_id == int(self.db.senior_admin_id) or self._get_admin_level(granter_id) >= effective_admin_min:
+                return True
 
         # ── Команды с требованием admin_level ────────────────────────────────
         if effective_admin_min > 0:
@@ -2489,14 +2925,7 @@ class FactionBot:
 
         # ── Публичные команды (effective_admin_min == 0) ──────────────────────
         # Чат-only команды недоступны в ЛС
-        if not ctx.is_chat and cmd in {
-            "!бан", "!кик", "!разбан", "!мут", "!размут", "!роли", "!создать", "!роль",
-            "!снять", "!переименовать", "!пуш", "!банлист", "!мутлист",
-            "!новоеприветствие", "!удалитьприветствие", "!заметка", "!заметки",
-            "!иммунитет", "!снятьиммунитет", "!иммунитеты", "!право", "!пред",
-            "!повысить", "!понизить", "!админы", "!снятьпред", "!списокпредов",
-            "!выговор", "!список",
-        }:
+        if not ctx.is_chat and cmd_norm in CHAT_ONLY_COMMANDS:
             return False
         if ctx.is_chat:
             role_lvl = self._get_role_level(ctx.chat_id, ctx.user_id)
@@ -2607,6 +3036,60 @@ class FactionBot:
             lines.append(f"{idx}. {self._fmt_user(int(row['author_id']))} — {row['info_text']} — дата {dt}")
         return "\n".join(lines)
 
+    def _extract_complaint_server(self, text: str, fallback: int) -> int:
+        t = (text or "").lower()
+        patterns = [
+            r"\brw\s*([123])\b",
+            r"\bсервер\D*([123])\b",
+            r"^\s*3[\).:-]?\s*(?:rw\s*)?([123])\b",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, t, flags=re.I | re.M)
+            if m:
+                return int(m.group(1))
+        return int(fallback or 1)
+
+    @staticmethod
+    def _nickname_match_distance(a: str, b: str) -> int:
+        return _levenshtein(a.lower(), b.lower())
+
+    def _complaint_nickname_links(self, text: str, reporter_id: int) -> list[str]:
+        raw_candidates = re.findall(r"\b[A-Za-z][A-Za-z0-9_]{3,31}\b", text or "")
+        skip = {"rw", "vk", "id", "http", "https", "com", "club", "public"}
+        candidates: list[str] = []
+        for cand in raw_candidates:
+            low = cand.lower()
+            if low in skip or low.startswith("id") and low[2:].isdigit():
+                continue
+            if cand not in candidates:
+                candidates.append(cand)
+        with self.db.conn() as c:
+            rows = c.execute(
+                "SELECT vk_id,nickname FROM users WHERE approved=1 AND TRIM(COALESCE(nickname,''))!=''"
+            ).fetchall()
+        known = [(int(r["vk_id"]), str(r["nickname"])) for r in rows]
+        matched: dict[str, tuple[int, str, int]] = {}
+        for cand in candidates:
+            best: Optional[tuple[int, str, int]] = None
+            for uid, nick in known:
+                dist = self._nickname_match_distance(cand, nick)
+                limit = 1 if len(cand) <= 6 else 2
+                if cand.lower() == nick.lower():
+                    dist = 0
+                if dist <= limit and (best is None or dist < best[2] or (dist == best[2] and len(nick) > len(best[1]))):
+                    best = (uid, nick, dist)
+            if best:
+                matched[best[1]] = best
+        reporter = self._user(reporter_id)
+        if reporter and reporter["nickname"]:
+            nick = str(reporter["nickname"])
+            matched.setdefault(nick, (int(reporter_id), nick, 0))
+        lines = []
+        for nick, (uid, real_nick, dist) in sorted(matched.items(), key=lambda x: x[0].lower()):
+            shown = real_nick if dist == 0 else f"{nick} → {real_nick}"
+            lines.append(f"{shown} = https://vk.com/id{uid}")
+        return lines
+
     def _wipe_user_data(self, target: int) -> None:
         with self.db.conn() as c:
             c.execute("DELETE FROM users WHERE vk_id=?", (target,))
@@ -2689,17 +3172,34 @@ class FactionBot:
         parts: list[str] = []
         if ctx.reply_text:
             parts.append(ctx.reply_text.strip())
+        for url in (ctx.reply_link_urls or []):
+            if url not in (ctx.reply_text or ""):
+                parts.append(url)
         text = "\n\n".join(p for p in parts if p).strip()
         return text or None
 
-    @staticmethod
-    def _attachment_id(att: dict) -> Optional[str]:
+    def _attachment_id(self, att: dict) -> Optional[str]:
         at = att.get("type")
         item = att.get(at, {}) if at else {}
         owner = item.get("owner_id")
         aid = item.get("id")
         if at and owner is not None and aid is not None:
             access_key = item.get("access_key")
+            if not access_key and at in ("video", "doc", "audio_message") and self.wall_api is not None:
+                # У группы (бота) часто нет прав напрямую видеть видео/файл обычного юзера —
+                # пробуем получить access_key через юзер-токен с более широкими правами.
+                try:
+                    if at == "video":
+                        info = self.wall_api.video.get(owner_id=owner, videos=[f"{owner}_{aid}"])
+                    elif at == "doc":
+                        info = self.wall_api.docs.getById(docs=[f"{owner}_{aid}"])
+                    else:
+                        info = None
+                    items = (info or {}).get("items", [])
+                    if items:
+                        access_key = items[0].get("access_key")
+                except Exception:
+                    pass
             if access_key:
                 return f"{at}{owner}_{aid}_{access_key}"
             return f"{at}{owner}_{aid}"
@@ -2708,6 +3208,16 @@ class FactionBot:
             if "owner_id" in doc and "id" in doc:
                 return f"doc{doc['owner_id']}_{doc['id']}"
         return None
+
+    @staticmethod
+    def _extract_link_urls(attachments: list[dict]) -> list[str]:
+        urls: list[str] = []
+        for a in attachments or []:
+            if a.get("type") == "link":
+                url = (a.get("link") or {}).get("url")
+                if url:
+                    urls.append(url)
+        return urls
 
     def _collect_attachment_ids(self, attachments: list[dict]) -> tuple[list[str], list[str]]:
         types: list[str] = []
@@ -2720,6 +3230,21 @@ class FactionBot:
             if aid:
                 ids.append(aid)
         return types, ids
+
+    def _complaint_id_from_notification_reply(self, ctx: Ctx) -> Optional[int]:
+        text = ctx.reply_text or ""
+        if not text:
+            return None
+        complaint_chat_id = int(self._get_setting("complaint_chat_id", "0") or 0)
+        if complaint_chat_id > 0 and (not ctx.is_chat or int(ctx.chat_id) != complaint_chat_id):
+            return None
+        if ctx.platform == "vk":
+            if int(ctx.reply_user_id or 0) not in {-int(self.group_id), int(self.group_id)}:
+                return None
+        if "#жалоба" not in text.lower():
+            return None
+        m = re.search(r"^\s*⚠️\s*Поступила новая жалоба\s*#(\d+)\b", text, flags=re.M)
+        return int(m.group(1)) if m else None
 
     def _community_group_id(self, faction: str) -> Optional[int]:
         if faction in self.community_group_ids:
@@ -2736,6 +3261,138 @@ class FactionBot:
             return None
         self.community_group_ids[faction] = gid
         return gid
+
+    def _extract_community_slug(self, raw: str) -> Optional[str]:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        text = text.split()[0].strip().strip("()[]<>")
+        text = text.replace("https://", "").replace("http://", "")
+        text = text.replace("m.vk.com/", "vk.com/").replace("vk.ru/", "vk.com/")
+        if text.startswith("vk.com/"):
+            text = text.split("vk.com/", 1)[1]
+        text = text.split("?", 1)[0].split("#", 1)[0].strip("/")
+        if text.startswith("club") and text[4:].isdigit():
+            return text
+        if text.startswith("public") and text[6:].isdigit():
+            return text
+        if re.fullmatch(r"[A-Za-z0-9_.-]{3,80}", text):
+            return text
+        return None
+
+    def _resolve_community(self, raw: str) -> Optional[dict]:
+        slug = self._extract_community_slug(raw)
+        if not slug:
+            return None
+        try:
+            data = self.api.utils.resolveScreenName(screen_name=slug)
+            if not data or data.get("type") not in {"group", "page"}:
+                return None
+            owner_id = -int(data["object_id"])
+            group_data = self.api.groups.getById(group_ids=str(abs(owner_id)))
+            if isinstance(group_data, dict) and "groups" in group_data:
+                group = (group_data.get("groups") or [{}])[0]
+            else:
+                group = group_data[0] if isinstance(group_data, list) and group_data else {}
+            domain = str(group.get("screen_name") or slug)
+            title = str(group.get("name") or domain)
+            return {"owner_id": owner_id, "domain": domain, "title": title, "url": f"https://vk.com/{domain}"}
+        except Exception:
+            return None
+
+    def _latest_wall_post_id(self, owner_id: int) -> int:
+        data = self._wall_get(int(owner_id), count=1)
+        items = data.get("items", []) if isinstance(data, dict) else []
+        return int(items[0].get("id") or 0) if items else 0
+
+    def _wall_get(self, owner_id: int, count: int = 5) -> dict:
+        if not WALL_READ_TOKEN:
+            if not self._wall_token_missing_logged:
+                logger.error(
+                    "VK wall subscriptions need VK_WALL_TOKEN, VK_USER_TOKEN, or VK_SERVICE_TOKEN. "
+                    "VK_GROUP_TOKEN cannot call wall.get."
+                )
+                self._wall_token_missing_logged = True
+            return {}
+        if self.wall_api is not None:
+            try:
+                data = self.wall_api.wall.get(owner_id=int(owner_id), count=int(count), filter="owner")
+                if isinstance(data, dict):
+                    return data
+            except Exception as e:
+                logger.error(f"wall.get via wall token failed for owner_id={owner_id}: {e}")
+        try:
+            resp = self.http.get(
+                "https://api.vk.com/method/wall.get",
+                params={
+                    "owner_id": int(owner_id),
+                    "count": int(count),
+                    "filter": "owner",
+                    "access_token": WALL_READ_TOKEN,
+                    "v": "5.199",
+                },
+                timeout=12,
+            ).json()
+            if "error" in resp:
+                logger.error(f"wall.get API error for owner_id={owner_id}: {resp['error']}")
+                return {}
+            return resp.get("response", {}) if isinstance(resp, dict) else {}
+        except Exception as e:
+            logger.error(f"wall.get HTTP fallback failed for owner_id={owner_id}: {e}")
+            return {}
+
+    def _format_wall_post(self, sub: dict, post: dict) -> tuple[str, list[str]]:
+        post_id = int(post.get("id") or 0)
+        owner_id = int(post.get("owner_id") or sub["owner_id"])
+        text = str(post.get("text") or "").strip()
+        date_ts = int(post.get("date") or self.now_ts())
+        link = f"https://vk.com/wall{owner_id}_{post_id}"
+        attachments: list[str] = []
+        for att in post.get("attachments", []) or []:
+            aid = self._attachment_id(att)
+            if aid:
+                attachments.append(aid)
+        if len(text) > 2600:
+            text = text[:2600].rstrip() + "\n…"
+        return (
+            f"📰 Новый пост: {sub['title']}\n"
+            f"🕒 {self._fmt_msk_dt(date_ts)}\n\n"
+            f"{text or '(без текста)'}\n\n"
+            f"{link}",
+            attachments,
+        )
+
+    def _subscription_poll_loop(self) -> None:
+        time.sleep(20)
+        while self.running:
+            try:
+                for sub in self.subscriptions_db.list_all():
+                    try:
+                        data = self._wall_get(int(sub["owner_id"]), count=5)
+                        items = data.get("items", []) if isinstance(data, dict) else []
+                        fresh = [
+                            p for p in items
+                            if int(p.get("id") or 0) > int(sub["last_post_id"] or 0)
+                            and not p.get("is_pinned")
+                            and str(p.get("post_type") or "post") == "post"
+                        ]
+                        fresh.sort(key=lambda p: int(p.get("id") or 0))
+                        for post in fresh:
+                            text, attachments = self._format_wall_post(sub, post)
+                            ping_all = int(sub.get("ping_all") or 0) == 1
+                            if ping_all:
+                                text = "@all\n" + text
+                            peer_id = self._chat_peer_id(int(sub["chat_id"]))
+                            if attachments:
+                                self.send_with_attachments(peer_id, text, attachments, disable_mentions=0 if ping_all else 1)
+                            else:
+                                self.send(peer_id, text, disable_mentions=0 if ping_all else 1)
+                            self.subscriptions_db.update_last_post(int(sub["id"]), int(post.get("id") or sub["last_post_id"]))
+                    except Exception as e:
+                        logger.error(f"subscription poll error for {sub.get('owner_id')}: {e}")
+            except Exception as e:
+                logger.error(f"_subscription_poll_loop error: {e}")
+            time.sleep(90)
 
     def _community_action(self, faction: str, action: str, target: int) -> bool:
         gid = self._community_group_id(faction)
@@ -2767,6 +3424,17 @@ class FactionBot:
                 (ch["faction"], int(ch["server_id"] or 1)),
             ).fetchone()
         return bool(leader and int(leader["vk_id"]) == user_id)
+
+    @staticmethod
+    def _is_role_management_command(cmd: str, text: str) -> bool:
+        """Команды управления ролями чата: выдача/снятие/создание/удаление/переименование роли,
+        список ролей. Используется чтобы дать лидеру фракции полный доступ к ролям в его чате."""
+        if cmd == "!роль" or cmd == "!роли" or cmd == "!переименовать":
+            return True
+        if cmd in {"!снять", "!создать", "!удалить"}:
+            second = (text.split()[1].lower() if len(text.split()) >= 2 else "")
+            return second == "роль"
+        return False
 
     def _is_leader_for(self, user_id: int, faction: str, server_id: int) -> bool:
         with self.db.conn() as c:
@@ -2802,41 +3470,21 @@ class FactionBot:
     def _apply_vk_mute(self, peer_id: int, target_id: int, duration_sec: int) -> bool:
         calls = [
             {"peer_id": peer_id, "member_ids": str(target_id), "action": "ro", "for": duration_sec},
-            {"peer_id": peer_id, "member_ids": [target_id], "action": "ro", "for": duration_sec},
-            {"peer_id": peer_id, "member_id": target_id, "for": duration_sec},
             {"peer_id": peer_id, "member_id": target_id, "action": "ro", "for": duration_sec},
         ]
         for payload in calls:
             if self._api_method("messages.changeConversationMemberRestrictions", payload):
                 return True
-            try:
-                self.api.messages.changeConversationMemberRestrictions(**payload)
-                return True
-            except Exception:
-                pass
         return False
 
     def _apply_vk_unmute(self, peer_id: int, target_id: int) -> bool:
         calls = [
             {"peer_id": peer_id, "member_ids": str(target_id), "action": "rw", "for": 0},
-            {"peer_id": peer_id, "member_ids": str(target_id), "action": "rw"},
-            {"peer_id": peer_id, "member_ids": [target_id], "action": "rw", "for": 0},
-            {"peer_id": peer_id, "member_ids": [target_id], "action": "rw"},
-            {"peer_id": peer_id, "member_id": target_id, "action": "rw"},
-            {"peer_id": peer_id, "member_id": target_id, "for": 0},
             {"peer_id": peer_id, "member_id": target_id, "action": "rw", "for": 0},
-            {"peer_id": peer_id, "member_id": target_id, "action": "ro", "for": 0},
-            {"peer_id": peer_id, "member_ids": str(target_id), "action": "ro", "for": 0},
-            {"peer_id": peer_id, "member_ids": [target_id], "action": "ro", "for": 0},
         ]
         for payload in calls:
             if self._api_method("messages.changeConversationMemberRestrictions", payload):
                 return True
-            try:
-                self.api.messages.changeConversationMemberRestrictions(**payload)
-                return True
-            except Exception:
-                pass
         return False
 
     # ---------- registration ----------
@@ -3280,6 +3928,13 @@ class FactionBot:
 
         if not session:
             return False
+
+        if not self._is_senior_admin_ctx(ctx):
+            with self.db.conn() as c:
+                c.execute("DELETE FROM admin_console_sessions WHERE vk_id=?", (ctx.user_id,))
+            self.admin_console_selected_faction.pop(ctx.user_id, None)
+            self.send(ctx.peer_id, "⛔ Админ-консоль закрыта: доступ только у старшего админа.")
+            return True
 
         state = session["state"]
         target_id = session["target_id"]
@@ -3785,6 +4440,45 @@ class FactionBot:
             logger.error(f"_add_history error in _do_resign: {e}")
         return f"✅ Пользователь {name_str} (id{user_id}) уволен."
 
+    def _send_greeting_payload(self, peer_id: int, text: str, attachment: str, sticker_id, on_partial_fail=None) -> None:
+        """Отправляет приветствие (текст + вложение/стикер), устойчиво к нерабочим вложениям.
+        Если комбинированная отправка не удалась — пробуем текст отдельно и каждое вложение по одному,
+        чтобы один битый/недоступный файл (например, чужое приватное видео без access_key) не убивал
+        всё приветствие целиком."""
+        if sticker_id:
+            try:
+                self.api.messages.send(peer_id=peer_id, random_id=0, sticker_id=int(sticker_id), disable_mentions=1)
+                return
+            except Exception as e:
+                logger.error(f"Ошибка отправки стикера приветствия: {e}")
+        attachments = [a for a in str(attachment or "").split(",") if a.strip()][:10]
+        kwargs = {"peer_id": peer_id, "random_id": 0, "message": text or "👋 Приветствие чата:", "disable_mentions": 1}
+        if attachments:
+            kwargs["attachment"] = ",".join(attachments)
+        try:
+            self.api.messages.send(**kwargs)
+            return
+        except Exception as e:
+            logger.error(f"Ошибка комбинированной отправки приветствия: {e}; attachments={attachments}")
+        # Фолбэк: текст отдельно
+        try:
+            self.api.messages.send(peer_id=peer_id, random_id=0, message=text or "👋 Приветствие чата:", disable_mentions=1)
+        except Exception as e:
+            logger.error(f"Ошибка отправки текста приветствия: {e}")
+        # Фолбэк: вложения по одному, пропускаем те что не отправляются
+        failed = []
+        for one in attachments:
+            try:
+                self.api.messages.send(
+                    peer_id=peer_id, random_id=random.randint(1, 2_147_483_647),
+                    message="📎 Вложение приветствия", attachment=one, disable_mentions=1,
+                )
+            except Exception as e:
+                logger.error(f"Вложение приветствия недоступно: {e}; attachment={one}")
+                failed.append(one)
+        if failed and on_partial_fail:
+            on_partial_fail(failed)
+
     def handle_command(self, ctx: Ctx) -> None:
         # Защита: обрезаем слишком длинный ввод (DoS защита)
         raw_text = (ctx.text or "")
@@ -3813,20 +4507,18 @@ class FactionBot:
         if self._is_bot_banned(ctx.user_id) and not is_senior:
             return
 
-        if low.startswith("!одобрить"):
-            self._approve_reject(ctx, True)
-            return
-        if low.startswith("!отказать"):
-            self._approve_reject(ctx, False)
-            return
-
         if self._handle_admin_console(ctx):
             return
 
         if not low.startswith("!"):
             with self.db.conn() as c:
-                ws = c.execute("SELECT target_id FROM wipe_sessions WHERE actor_id=?", (ctx.user_id,)).fetchone()
+                ws = c.execute("SELECT target_id,created_at FROM wipe_sessions WHERE actor_id=?", (ctx.user_id,)).fetchone()
             if ws:
+                if self.now_ts() - int(ws["created_at"] or 0) > WIPE_SESSION_TTL_SEC:
+                    with self.db.conn() as c:
+                        c.execute("DELETE FROM wipe_sessions WHERE actor_id=?", (ctx.user_id,))
+                    self.send(ctx.peer_id, "⏳ Сессия стирания данных истекла. Запустите команду заново.")
+                    return
                 if ctx.text.strip() == WIPE_PASSWORD:
                     target = int(ws["target_id"])
                     snapshot = self._snapshot_user_before_wipe(target)
@@ -3870,6 +4562,8 @@ class FactionBot:
             cmd = "!удалить список"
         if cmd == "!новый" and len(pre_parts) >= 2 and pre_parts[1].lower() == "список":
             cmd = "!новый список"
+        if cmd == "!новая" and len(pre_parts) >= 2 and pre_parts[1].lower() == "подписка":
+            cmd = "!новая подписка"
         if cmd == "!все" and len(pre_parts) >= 2 and pre_parts[1].lower() == "списки":
             cmd = "!все списки"
         if cmd == "!дж" and len(pre_parts) >= 3 and pre_parts[1].lower() == "в" and pre_parts[2].lower() in {"роли", "роль"}:
@@ -3881,6 +4575,8 @@ class FactionBot:
             cmd = "!новое приветствие"
         if cmd == "!список" and len(pre_parts) >= 2 and pre_parts[1].lower() == "доступ":
             cmd = "!список доступ"
+        if cmd == "!список" and len(pre_parts) >= 2 and pre_parts[1].lower() == "выговоров":
+            cmd = "!список выговоров"
         if cmd == "!все" and len(pre_parts) >= 2 and pre_parts[1].lower() == "списки":
             cmd = "!все списки"
         if cmd == "!удалить" and len(pre_parts) >= 2 and pre_parts[1].lower() == "приветствие":
@@ -3973,6 +4669,10 @@ class FactionBot:
             return
 
         self._remember_chat_command(ctx, text)
+
+        if cmd in {"!одобрить", "!отказать"}:
+            self._approve_reject(ctx, cmd == "!одобрить")
+            return
 
         if cmd == "!я":
             self.cmd_profile(ctx)
@@ -4177,14 +4877,15 @@ class FactionBot:
             return
 
         if cmd == "!логи" and ctx.is_chat:
-            items = list(self.chat_command_history.get(ctx.chat_id, deque()))
+            items = self._last_chat_command_logs(int(ctx.chat_id), 20)
             if not items:
                 self.send(ctx.peer_id, "📜 Логи команд: пусто.")
                 return
-            tail = items[-20:]
             lines = ["📜 Последние 20 команд в этом чате:"]
-            for idx, (uid, used_cmd, ts) in enumerate(reversed(tail), start=1):
-                dt = self._fmt_msk_dt(int(ts))
+            for idx, item in enumerate(items, start=1):
+                uid = int(item["vk_id"])
+                used_cmd = str(item["command"])
+                dt = self._fmt_msk_dt(int(item["created_at"]))
                 lines.append(f"{idx}. {used_cmd} — {self._fmt_user(int(uid))} — {dt}")
             self.send(ctx.peer_id, "\n".join(lines))
             return
@@ -4447,22 +5148,17 @@ class FactionBot:
                 self.send(ctx.peer_id, "ℹ️ Приветствие для этого чата не установлено.\nЧтобы установить, ответьте на сообщение: !новое приветствие")
                 return
             # Воспроизводим приветствие
-            kwargs = {"peer_id": ctx.peer_id, "random_id": 0, "disable_mentions": 1}
-            if str(row["text"]).strip():
-                kwargs["message"] = str(row["text"])
-            else:
-                kwargs["message"] = "👋 Приветствие чата:"
-            if str(row["attachment"] or "").strip():
-                kwargs["attachment"] = str(row["attachment"])
-            if row["sticker_id"]:
-                kwargs["sticker_id"] = int(row["sticker_id"])
-                kwargs.pop("message", None)
-                kwargs.pop("attachment", None)
-            try:
-                self.api.messages.send(**kwargs)
-            except Exception:
-                self.send(ctx.peer_id, str(row["text"] or "(без текста)"))
+            def _notify_failed(failed_list, _peer=ctx.peer_id):
+                self.send(_peer, f"⚠️ {len(failed_list)} вложение(й) приветствия недоступны и не были отправлены.")
+            self._send_greeting_payload(
+                ctx.peer_id,
+                str(row["text"] or ""),
+                str(row["attachment"] or ""),
+                row["sticker_id"],
+                on_partial_fail=_notify_failed,
+            )
             return
+
 
         if cmd == "!новое приветствие":
             if not ctx.is_chat:
@@ -4471,20 +5167,60 @@ class FactionBot:
             if self._get_admin_level(ctx.user_id) < 40 and not self._is_senior_admin_ctx(ctx) and not self._is_leader_user(ctx.user_id):
                 self.send(ctx.peer_id, "⛔ Для установки приветствия нужен admin 40+ или лидер фракции.")
                 return
-            if not ctx.reply_text and not ctx.reply_user_id:
+            if not ctx.reply_text and not ctx.reply_user_id and not ctx.reply_attachment_ids:
                 self.send(ctx.peer_id, "❌ Используйте команду ОТВЕТОМ на сообщение, которое станет приветствием.")
                 return
             # Извлекаем текст и вложения из reply
             greet_text = ctx.reply_text or ""
-            # Вложения из reply мы не можем получить напрямую через ctx — используем peer_id для пересылки
-            # Сохраняем что есть
+            for url in (ctx.reply_link_urls or []):
+                if url not in greet_text:
+                    greet_text = (greet_text + "\n\n" + url).strip()
+            attachment_ids = (ctx.reply_attachment_ids or [])[:10]
+            if not greet_text.strip() and not attachment_ids:
+                self.send(ctx.peer_id, "❌ Сообщение, на которое вы ответили, не содержит ни текста, ни поддерживаемых вложений.")
+                return
+            # Проверяем каждое вложение пробной отправкой — боту (группе) может не хватать прав на
+            # просмотр приватного видео/файла другого пользователя, даже если объект корректно
+            # распознан. Лучше предупредить сразу при сохранении, чем молча терять вложение позже,
+            # когда зайдёт новый участник. Пробное сообщение сразу удаляем, чтобы не засорять чат.
+            working_ids: list[str] = []
+            broken_ids: list[str] = []
+            for aid in attachment_ids:
+                try:
+                    probe = self.api.messages.send(
+                        peer_id=ctx.peer_id, random_id=random.randint(1, 2_147_483_647),
+                        message="🔎 Проверка вложения для приветствия", attachment=aid, disable_mentions=1,
+                    )
+                    working_ids.append(aid)
+                    try:
+                        probe_mid = int(probe)
+                    except (TypeError, ValueError):
+                        probe_mid = None
+                    if probe_mid:
+                        try:
+                            self._api_method("messages.delete", {"message_ids": str(probe_mid), "delete_for_all": 1})
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.error(f"Вложение приветствия не прошло проверку при сохранении: {e}; attachment={aid}")
+                    broken_ids.append(aid)
+            stored_attachment = ",".join(working_ids)
+            if not greet_text.strip() and not stored_attachment:
+                self.send(ctx.peer_id, "❌ Ни одно вложение не удалось отправить (бот не имеет к ним доступа), а текста нет. Приветствие не сохранено.")
+                return
             now = self.now_ts()
             with self.db.conn() as c:
                 c.execute(
                     "INSERT OR REPLACE INTO chat_greetings(chat_id, text, attachment, created_by, updated_at) VALUES(?,?,?,?,?)",
-                    (ctx.chat_id, greet_text.strip(), "", ctx.user_id, now),
+                    (ctx.chat_id, greet_text.strip(), stored_attachment, ctx.user_id, now),
                 )
-            self.send(ctx.peer_id, f"✅ Приветствие установлено.\nПросмотр: !приветствие")
+            warn = ""
+            if broken_ids:
+                warn = (
+                    f"\n⚠️ {len(broken_ids)} вложение(й) бот не смог отправить (нет доступа, например приватное "
+                    f"видео автора) и они НЕ были сохранены в приветствие."
+                )
+            self.send(ctx.peer_id, f"✅ Приветствие установлено.\nПросмотр: !приветствие{warn}")
             return
 
         if cmd == "!удалить приветствие":
@@ -4754,7 +5490,7 @@ class FactionBot:
                 
                 # Информация об иммунитете
                 admin_threshold = int(self._get_setting("silence_admin_threshold", "40"))
-                immune_info = f"\n👑 Иммунитет имеют: фракция Админ, лидеры фракций, админы {admin_threshold}+"
+                immune_info = f"\n👑 Иммунитет имеют: админы {admin_threshold}+ и пользователи с временным голосом"
                 
                 self.send(ctx.peer_id, 
                     f"✅ Режим тишины включен: {msg_limit} сообщ. раз в {window_min} мин. на пользователя."
@@ -4779,7 +5515,7 @@ class FactionBot:
                     f"📊 Настройки тишины в этом чате:\n"
                     f"• {int(rule['msg_limit'])} сообщ. раз в {int(rule['window_min'])} мин.\n"
                     f"• Статус: {'Включен' if int(rule['enabled']) else 'Выключен'}\n"
-                    f"• Иммунитет: фракция Админ, лидеры фракций, админы {admin_threshold}+"
+                    f"• Иммунитет: админы {admin_threshold}+ и временный голос"
                 )
                 return
             
@@ -5171,32 +5907,63 @@ class FactionBot:
                         deleted = 1
                         break
                 if deleted:
-                    self.send(ctx.peer_id, "✅ Сообщение удалено.")
+                    self._active_command = None
                 else:
                     self.send(ctx.peer_id, "❌ Не удалось удалить сообщение.")
                 return
             if len(parts) < 2:
-                self.send(ctx.peer_id, "Формат: !чистка (количество) или !чистка (время: 10м/2ч) или reply без аргументов.")
+                self.send(ctx.peer_id, "Формат: !чистка (количество) или !чистка (время: 10м/2ч/10 мин/20 часов) или reply без аргументов.")
                 return
+            # Собираем аргумент времени — единица измерения может идти слитно ("10м") или
+            # отдельным словом через пробел ("10 мин", "20 часов", "20 ч").
             arg = parts[1].lower()
+            rest = parts[2].lower() if len(parts) >= 3 else ""
             ids_to_delete: list[int] = []
             cmids_to_delete: list[int] = []
             try:
-                hist = self.api.messages.getHistory(peer_id=ctx.peer_id, count=200)
-                items = hist.get("items", [])
-                if arg.isdigit():
+                if arg.isdigit() and not rest:
                     limit = min(int(arg), 200)
+                    hist = self.api.messages.getHistory(peer_id=ctx.peer_id, count=limit)
+                    items = hist.get("items", [])
                     ids_to_delete = [int(m["id"]) for m in items[:limit] if m.get("id") is not None]
                     cmids_to_delete = [int(m["conversation_message_id"]) for m in items[:limit] if m.get("conversation_message_id") is not None]
                 else:
-                    m = re.match(r"^(\\d+)([мmhчh])$", arg)
-                    if not m:
-                        self.send(ctx.peer_id, "❌ Неверный формат времени. Пример: 10м или 2ч.")
+                    m = re.match(r"^(\d+)\s*([мmhчh])", arg) if not arg.isdigit() else None
+                    if m:
+                        val, unit = int(m.group(1)), m.group(2)
+                    elif arg.isdigit() and rest:
+                        val = int(arg)
+                        unit = rest[0]
+                    else:
+                        self.send(ctx.peer_id, "❌ Неверный формат времени. Примеры: 10м, 2ч, 10 мин, 20 часов.")
                         return
-                    val = int(m.group(1))
-                    unit = m.group(2)
-                    sec = val * 60 if unit in {"м", "m"} else val * 3600
+                    sec_per_unit = 60 if unit in {"м", "m"} else 3600
+                    sec = val * sec_per_unit
+
+                    # Лимит для обычных пользователей: не больше 24 часов за одну чистку.
+                    # Фракция "Админ" (SECRET_FACTION) и пользователи с admin_level > 20 — без лимита.
+                    actor = self._user(ctx.user_id)
+                    actor_faction = actor["faction"] if actor else None
+                    is_unlimited = actor_faction == SECRET_FACTION or actor_admin > 20
+                    max_sec = 24 * 3600
+                    if not is_unlimited and sec > max_sec:
+                        self.send(ctx.peer_id, "⛔ Для вашей роли максимум — 24 часа за одну чистку. Пример: !чистка 24 часа")
+                        return
+
                     cutoff = self.now_ts() - sec
+                    items: list[dict] = []
+                    offset = 0
+                    # Подгружаем историю страницами по 200, пока не выйдем за cutoff или за разумный предел.
+                    for _ in range(60):  # до 12000 сообщений вглубь — с запасом на сутки активного чата
+                        hist = self.api.messages.getHistory(peer_id=ctx.peer_id, count=200, offset=offset)
+                        page = hist.get("items", [])
+                        if not page:
+                            break
+                        items.extend(page)
+                        offset += len(page)
+                        oldest_date = int(page[-1].get("date", 0))
+                        if oldest_date < cutoff or len(page) < 200:
+                            break
                     picked = [msg for msg in items if int(msg.get("date", 0)) >= cutoff]
                     ids_to_delete = [int(msg["id"]) for msg in picked if msg.get("id") is not None]
                     cmids_to_delete = [int(msg["conversation_message_id"]) for msg in picked if msg.get("conversation_message_id") is not None]
@@ -5225,7 +5992,10 @@ class FactionBot:
                         ok = self._api_method("messages.delete", {"message_ids": ",".join(str(x) for x in chunk)})
                         if ok:
                             deleted += len(chunk)
-                self.send(ctx.peer_id, f"✅ Очистка выполнена. Удалено сообщений: {deleted}")
+                if deleted == 0:
+                    self.send(ctx.peer_id, "❌ Не удалось удалить сообщения. Проверьте права бота в беседе.")
+                else:
+                    self._active_command = None
             except Exception:
                 self.send(ctx.peer_id, "❌ Не удалось выполнить очистку. Проверьте права бота в беседе.")
             return
@@ -5627,6 +6397,10 @@ class FactionBot:
             if cmd_norm not in COMMAND_ACCESS:
                 self.send(ctx.peer_id, f"❌ Неизвестная команда: {cmd_target}")
                 return
+            target_admin_min = self._get_effective_admin_min(cmd_norm)
+            if target_admin_min > actor_admin and not self._is_senior_admin_ctx(ctx):
+                self.send(ctx.peer_id, f"⛔ Нельзя выдать {cmd_norm}: для неё нужен admin {target_admin_min}+.")
+                return
             with self.db.conn() as c:
                 c.execute(
                     "INSERT OR REPLACE INTO user_cmd_allow(target_vk_id,command,granted_by,granted_at) VALUES(?,?,?,?)",
@@ -5853,6 +6627,87 @@ class FactionBot:
             self.send(ctx.peer_id, f"✅ Запрос синхронизации отправлен. Номер: {req_id}. Таймаут: 24 часа.")
             return
 
+        if cmd == "!новая подписка":
+            if not ctx.is_chat:
+                self.send(ctx.peer_id, "⛔ Подписки на сообщества настраиваются только в чате.")
+                return
+            if not WALL_READ_TOKEN:
+                self.send(
+                    ctx.peer_id,
+                    "⛔ Подписки не смогут читать новые посты без токена чтения стены.\n"
+                    "Добавьте в .env VK_WALL_TOKEN (или VK_USER_TOKEN/VK_SERVICE_TOKEN) и перезапустите бота.",
+                )
+                return
+            if len(parts) < 3:
+                self.send(ctx.peer_id, "Формат: !новая подписка (ссылка на сообщество)")
+                return
+            raw_link = parts[2]
+            community = self._resolve_community(raw_link)
+            if not community:
+                self.send(ctx.peer_id, "❌ Не удалось распознать сообщество. Укажите ссылку вида https://vk.com/community")
+                return
+            last_post_id = self._latest_wall_post_id(int(community["owner_id"]))
+            ok = self.subscriptions_db.add_subscription(
+                chat_id=int(ctx.chat_id),
+                owner_id=int(community["owner_id"]),
+                domain=str(community["domain"]),
+                title=str(community["title"]),
+                url=str(community["url"]),
+                created_by=int(ctx.user_id),
+                created_at=self.now_ts(),
+                last_post_id=last_post_id,
+            )
+            if not ok:
+                self.send(ctx.peer_id, f"ℹ️ В этом чате уже есть подписка на {community['title']}.")
+                return
+            self.send(ctx.peer_id, f"✅ Подписка добавлена: {community['title']}\nНовые посты будут приходить в этот чат.")
+            return
+
+        if cmd == "!подписка":
+            if not ctx.is_chat:
+                self.send(ctx.peer_id, "⛔ Команда работает только в чате.")
+                return
+            if len(parts) == 3 and parts[1].lower() == "пинг" and parts[2].lower() in {"вкл", "выкл"}:
+                enabled = parts[2].lower() == "вкл"
+                changed = self.subscriptions_db.set_chat_ping_all(int(ctx.chat_id), enabled)
+                if changed <= 0:
+                    self.send(ctx.peer_id, "📭 В этом чате нет подписок на сообщества.")
+                    return
+                self.send(ctx.peer_id, f"✅ Пинг @all для новых постов {'включен' if enabled else 'выключен'}.")
+                return
+            self.send(ctx.peer_id, "Формат: !подписка пинг вкл / !подписка пинг выкл")
+            return
+
+        if cmd == "!подписки":
+            if not ctx.is_chat:
+                self.send(ctx.peer_id, "⛔ Команда работает только в чате.")
+                return
+            rows = self.subscriptions_db.list_chat(int(ctx.chat_id))
+            if not rows:
+                self.send(ctx.peer_id, "📭 В этом чате нет подписок на сообщества.")
+                return
+            lines = ["📬 Подписки этого чата:"]
+            for idx, row in enumerate(rows, start=1):
+                ping_state = "пинг @all: вкл" if int(row.get("ping_all") or 0) == 1 else "пинг @all: выкл"
+                lines.append(f"{idx}. {row['title']} — {row['url']} ({ping_state})")
+            self.send(ctx.peer_id, "\n".join(lines))
+            return
+
+        if cmd == "!отписаться":
+            if not ctx.is_chat:
+                self.send(ctx.peer_id, "⛔ Команда работает только в чате.")
+                return
+            if len(parts) < 2:
+                self.send(ctx.peer_id, "Формат: !отписаться (ссылка на сообщество)")
+                return
+            community = self._resolve_community(parts[1])
+            if not community:
+                self.send(ctx.peer_id, "❌ Не удалось распознать сообщество.")
+                return
+            ok = self.subscriptions_db.remove_subscription(int(ctx.chat_id), int(community["owner_id"]))
+            self.send(ctx.peer_id, f"✅ Подписка снята: {community['title']}" if ok else "ℹ️ В этом чате такой подписки не было.")
+            return
+
         if cmd == "!жалоба":
             if ctx.reply_user_id is None:
                 self.send(
@@ -5863,15 +6718,34 @@ class FactionBot:
                 return
             extra_info = " ".join(parts[1:]).strip() or "не указана"
             reply_text = (ctx.reply_text or "").strip()
+            allowed_attachment_prefixes = ("photo", "video", "doc", "audio", "audio_message")
             reply_attachments = [
-                a for a in (ctx.reply_attachment_ids or [])
-                if str(a).startswith("photo") or str(a).startswith("video")
-            ]
+                aid for aid in dict.fromkeys(ctx.reply_attachment_ids or [])
+                if str(aid).startswith(allowed_attachment_prefixes)
+            ][:5]
             reporter = self._user(ctx.user_id)
             target = self._user(int(ctx.reply_user_id))
             reporter_name = (reporter["nickname"] if reporter and reporter["nickname"] else self._fmt_user(ctx.user_id))
             target_name = (target["nickname"] if target and target["nickname"] else "")
-            actor_server = int(reporter["server_id"] or 1) if reporter else 1
+            actor_server = self._extract_complaint_server(reply_text, int(reporter["server_id"] or 1) if reporter else 1)
+            nick_links = self._complaint_nickname_links(reply_text, int(ctx.user_id))
+            if int(ctx.reply_user_id) == int(ctx.user_id):
+                reporter_nick = str(reporter["nickname"] or "").lower() if reporter and reporter["nickname"] else ""
+                raw_nicks = [
+                    n for n in re.findall(r"\b[A-Za-z][A-Za-z0-9_]{3,31}\b", reply_text)
+                    if n.lower() not in {"rw", "vk", "http", "https", "com"}
+                    and (not reporter_nick or n.lower() != reporter_nick)
+                ]
+                complaint_candidates = [
+                    line for line in nick_links
+                    if not reporter_nick or not line.lower().startswith(reporter_nick + " =")
+                ]
+                if not complaint_candidates and not raw_nicks:
+                    self.send(
+                        ctx.peer_id,
+                        "❌ В тексте жалобы не найден ник нарушителя. Укажите игровое имя нарушителя в сообщении жалобы.",
+                    )
+                    return
             with self.db.conn() as c:
                 cur = c.execute(
                     """
@@ -5889,32 +6763,55 @@ class FactionBot:
                 )
                 complaint_id = int(cur.lastrowid)
             complaint_chat_id = int(self._get_setting("complaint_chat_id", str(ctx.chat_id or 0)) or 0)
-            mentions = " ".join([self._fmt_user(uid) for uid in self._complaint_admin_mentions(complaint_chat_id, actor_server)]) if ctx.platform == "vk" else ""
+            if complaint_chat_id > 0:
+                with self.db.conn() as c:
+                    c.execute(
+                        "INSERT OR REPLACE INTO silence_exceptions(chat_id,vk_id,until_ts) VALUES(?,?,?)",
+                        (complaint_chat_id, int(ctx.user_id), self.now_ts() + 600),
+                    )
+            if ctx.platform == "vk":
+                mention_ids = self._complaint_admin_mentions(complaint_chat_id, actor_server)
+                mention_map = self._fmt_users_bulk(mention_ids)
+                mentions = " ".join(mention_map[uid] for uid in mention_ids if uid in mention_map)
+            else:
+                mentions = ""
             notify_lines = [
                 f"⚠️ Поступила новая жалоба #{complaint_id}.",
-                f"1. Заявитель: {reporter_name}, {self._platform_profile_ref(ctx.platform, ctx.user_id)}",
+                f"1. Заявитель: {reporter_name}",
             ]
             if target and int(ctx.reply_user_id) != int(ctx.user_id) and target_name and target_name != reporter_name:
-                notify_lines.append(
-                    f"2. На кого жалоба: {target_name}, {self._platform_profile_ref(ctx.platform, int(ctx.reply_user_id))}"
-                )
+                notify_lines.append(f"2. На кого жалоба: {target_name}")
             notify_lines.append(f"3. Сервер: {actor_server}")
             notify_lines.append(f"4. Доп. информация: {extra_info}")
             if reply_text:
                 notify_lines.append("↩️ Текст сообщения:")
                 notify_lines.append(reply_text)
-            notify_lines.append("#жалоба")
+            if "#жалоба" not in reply_text.lower():
+                notify_lines.append("#жалоба")
+            if nick_links:
+                notify_lines.append("🔎 Найденные никнеймы:")
+                notify_lines.extend(nick_links)
             notify = "\n".join(notify_lines)
             if mentions:
                 notify += "\n" + mentions
             if complaint_chat_id > 0:
-                if reply_attachments and ctx.platform == "vk":
-                    self.send_with_attachments(self._chat_peer_id(complaint_chat_id), notify, reply_attachments)
+                if ctx.platform == "vk":
+                    self.send_with_forwarded_message(
+                        self._chat_peer_id(complaint_chat_id),
+                        notify,
+                        [int(ctx.reply_message_id)] if ctx.reply_message_id else [],
+                        reply_attachments,
+                    )
                 else:
                     self.send_chat(complaint_chat_id, notify)
             else:
-                if reply_attachments and ctx.platform == "vk":
-                    self.send_with_attachments(ctx.peer_id, notify, reply_attachments)
+                if ctx.platform == "vk":
+                    self.send_with_forwarded_message(
+                        ctx.peer_id,
+                        notify,
+                        [int(ctx.reply_message_id)] if ctx.reply_message_id else [],
+                        reply_attachments,
+                    )
                 else:
                     self.send(ctx.peer_id, notify)
             self.send(ctx.peer_id, "✅ Жалоба отправлена в чат жалоб.")
@@ -5926,31 +6823,91 @@ class FactionBot:
                 return
             with self.db.conn() as c:
                 rows = c.execute(
-                    "SELECT id,reporter_id,target_id,created_at FROM complaints WHERE status='open' ORDER BY id ASC"
+                    "SELECT id,reporter_id,review_by,review_at,created_at FROM complaints WHERE status='open' ORDER BY id ASC"
                 ).fetchall()
             if not rows:
                 self.send(ctx.peer_id, "📭 Открытых жалоб нет.")
                 return
+            user_ids = []
+            for r in rows:
+                user_ids.append(int(r["reporter_id"]))
+                if r["review_by"]:
+                    user_ids.append(int(r["review_by"]))
+            name_map = self._fmt_users_bulk(user_ids)
             out = ["📋 Открытые жалобы:"]
             for r in rows:
+                reporter_id = int(r["reporter_id"])
                 dt = datetime.fromtimestamp(int(r["created_at"])).strftime("%d.%m.%Y %H:%M")
-                out.append(f"• #{int(r['id'])} | репортёр: {self._fmt_user(int(r['reporter_id']))} | цель: {self._fmt_user(int(r['target_id']))} | {dt}")
-            self.send(ctx.peer_id, "\n".join(out))
+                line = (
+                    f"• #{int(r['id'])} | репортёр: {name_map.get(reporter_id, self._fmt_user_ref(reporter_id))}"
+                )
+                if r["review_by"]:
+                    reviewer_id = int(r["review_by"])
+                    line += f" | на рассмотрении у {name_map.get(reviewer_id, self._fmt_user_ref(reviewer_id))}"
+                line += f" | {dt}"
+                out.append(line)
+            self._send_long_text(ctx.peer_id, "\n".join(out))
             return
 
-        if cmd in {"!принять", "!отклонить"} and len(parts) >= 3 and parts[1].lower() == "жалобу" and parts[2].isdigit():
+        if cmd == "!рассмотрение":
             if not self._is_admin_faction_user(ctx.user_id):
                 self.send(ctx.peer_id, "⛔ Команда доступна только фракции Админ.")
                 return
-            complaint_id = int(parts[2])
-            is_accept = cmd == "!принять"
+            complaint_id = None
+            if len(parts) >= 2 and parts[1].isdigit():
+                complaint_id = int(parts[1])
+            elif ctx.reply_text:
+                complaint_id = self._complaint_id_from_notification_reply(ctx)
+            if complaint_id is None:
+                self.send(ctx.peer_id, "Формат: !рассмотрение (номер жалобы) или ответом на сообщение жалобы.")
+                return
+            now = self.now_ts()
             with self.db.conn() as c:
-                row = c.execute("SELECT id,target_id,status FROM complaints WHERE id=?", (complaint_id,)).fetchone()
+                row = c.execute(
+                    "SELECT id,status,review_by FROM complaints WHERE id=?",
+                    (complaint_id,),
+                ).fetchone()
                 if not row:
                     self.send(ctx.peer_id, "❌ Жалоба не найдена.")
                     return
                 if row["status"] != "open":
                     self.send(ctx.peer_id, "❌ Жалоба уже закрыта.")
+                    return
+                if row["review_by"] and int(row["review_by"]) != int(ctx.user_id):
+                    self.send(ctx.peer_id, f"ℹ️ Жалоба #{complaint_id} уже на рассмотрении у {self._fmt_user(int(row['review_by']))}.")
+                    return
+                c.execute(
+                    "UPDATE complaints SET review_by=?, review_at=? WHERE id=?",
+                    (int(ctx.user_id), now, complaint_id),
+                )
+            self.send(ctx.peer_id, f"✅ Жалоба #{complaint_id} взята на рассмотрение: {self._fmt_user(ctx.user_id)}.")
+            return
+
+        if cmd in {"!принять", "!отклонить"}:
+            if not self._is_admin_faction_user(ctx.user_id):
+                self.send(ctx.peer_id, "⛔ Команда доступна только фракции Админ.")
+                return
+            complaint_id = None
+            if len(parts) >= 3 and parts[1].lower() == "жалобу" and parts[2].isdigit():
+                complaint_id = int(parts[2])
+            elif len(parts) >= 2 and parts[1].isdigit():
+                complaint_id = int(parts[1])
+            elif ctx.reply_text:
+                complaint_id = self._complaint_id_from_notification_reply(ctx)
+            if complaint_id is None:
+                self.send(ctx.peer_id, f"Формат: {cmd} (номер жалобы) или ответом на сообщение жалобы.")
+                return
+            is_accept = cmd == "!принять"
+            with self.db.conn() as c:
+                row = c.execute("SELECT id,target_id,status,review_by FROM complaints WHERE id=?", (complaint_id,)).fetchone()
+                if not row:
+                    self.send(ctx.peer_id, "❌ Жалоба не найдена.")
+                    return
+                if row["status"] != "open":
+                    self.send(ctx.peer_id, "❌ Жалоба уже закрыта.")
+                    return
+                if row["review_by"] and int(row["review_by"]) != int(ctx.user_id):
+                    self.send(ctx.peer_id, f"⛔ Жалоба #{complaint_id} уже на рассмотрении у {self._fmt_user(int(row['review_by']))}.")
                     return
                 target_id = int(row["target_id"])
                 c.execute(
@@ -6115,19 +7072,20 @@ class FactionBot:
             )
             return
 
-        if cmd == "!список" and len(parts) >= 2 and parts[1].lower() == "выговоров":
-            if self._get_admin_level(ctx.user_id) < 5:
-                self.send(ctx.peer_id, "⛔ Команда доступна с 5 уровня админ-прав.")
-                return
+        if cmd in {"!список выговоров", "!выговоры"}:
             actor = self._user(ctx.user_id)
             actor_faction = actor["faction"] if actor else None
             if actor_faction == SECRET_FACTION:
-                faction = " ".join(parts[2:]).strip() if len(parts) > 2 else ""
-                if not faction:
-                    self.send(ctx.peer_id, "Формат для Админ: !список выговоров (фракция)")
+                start_idx = 2 if cmd == "!список выговоров" else 1
+                ff, rest = self._extract_faction_and_rest(parts, start_idx)
+                if not ff or not rest or not rest[0].isdigit():
+                    self.send(ctx.peer_id, "Формат для Админ: !список выговоров (фракция) (сервер) или !выговоры (фракция) (сервер)")
                     return
-                faction = next((f for f in ALL_FACTIONS if f.lower() == faction.lower()), faction)
-                server_id = 1
+                faction = ff
+                server_id = int(rest[0])
+                if server_id < 1 or server_id > 3:
+                    self.send(ctx.peer_id, "❌ Сервер должен быть 1, 2 или 3.")
+                    return
             else:
                 faction = actor_faction
                 server_id = int(actor["server_id"] or 1) if actor else 1
@@ -6385,12 +7343,13 @@ class FactionBot:
                     self.send(ctx.peer_id, "Формат: !роль (пользователь) (уровень)")
                     return
                 lvl = int(parts[2])
+                is_chat_leader = self._is_leader_for_chat_faction(ctx.user_id, ctx.chat_id)
                 actor_lvl = self._get_role_level(ctx.chat_id, ctx.user_id)
                 target_lvl = self._get_role_level(ctx.chat_id, target)
-                if actor_lvl < target_lvl and self._get_admin_level(ctx.user_id) < 100:
+                if not is_chat_leader and actor_lvl < target_lvl and self._get_admin_level(ctx.user_id) < 100:
                     self.send(ctx.peer_id, "⛔ Нельзя менять роль пользователю выше вашего уровня.")
                     return
-                if lvl > actor_lvl and self._get_admin_level(ctx.user_id) < 100:
+                if not is_chat_leader and lvl > actor_lvl and self._get_admin_level(ctx.user_id) < 100:
                     self.send(ctx.peer_id, "⛔ Нельзя выдать роль выше своей.")
                     return
                 with self.db.conn() as c:
@@ -6551,15 +7510,16 @@ class FactionBot:
             if not rows:
                 self.send(ctx.peer_id, "📋 В чате 0 людей с должностью выше одобренного пользователя.")
                 return
+            name_map = self._fmt_users_bulk([int(r["vk_id"]) for r in rows])
             grouped: dict[str, list[str]] = {}
             for r in rows:
+                uid = int(r["vk_id"])
                 role_label = f"{r['name'] or 'Роль'} ({int(r['role_level'])})"
-                grouped.setdefault(role_label, []).append(self._fmt_user(int(r["vk_id"])))
+                grouped.setdefault(role_label, []).append(name_map.get(uid, self._fmt_user_ref(uid)))
             lines = [f"📋 В чате {len(rows)} людей с должностью выше одобренного пользователя:"]
             for role_label, users in grouped.items():
                 lines.append(f"• {role_label}: {', '.join(users)}")
-            text_out = "\n".join(lines)
-            self.send(ctx.peer_id, text_out)
+            self._send_long_text(ctx.peer_id, "\n".join(lines))
             return
 
         # admin-only globals
@@ -6590,6 +7550,9 @@ class FactionBot:
 
         if cmd == "!стереть" and len(parts) >= 2:
             # Double-check: читаем admin_level из БД (не из кэша) + проверяем сессию
+            if not WIPE_PASSWORD or len(WIPE_PASSWORD) < 16 or WIPE_PASSWORD == "2n3Z5opi":
+                self.send(ctx.peer_id, "⛔ WIPE_PASSWORD не задан или слишком слабый. Установите пароль длиной от 16 символов в .env.")
+                return
             with self.db.conn() as _c:
                 _sa_row = _c.execute("SELECT admin_level FROM users WHERE vk_id=?", (ctx.user_id,)).fetchone()
             _db_lvl = int(_sa_row["admin_level"]) if _sa_row else 0
@@ -7721,7 +8684,7 @@ class FactionBot:
                 self.send(ctx.peer_id, "❌ Название заметки должно быть одним словом.")
                 return
             content = self._compose_reply_note_content(ctx) or ""
-            attachment_ids = ctx.reply_attachment_ids or []
+            attachment_ids = (ctx.reply_attachment_ids or [])[:10]
             if not content and not attachment_ids:
                 self.send(ctx.peer_id, "Формат: !новая заметка (название) только ответом на сообщение с текстом/вложениями")
                 return
@@ -7749,7 +8712,7 @@ class FactionBot:
                 self.send(ctx.peer_id, "❌ Название заметки должно быть одним словом.")
                 return
             content = self._compose_reply_note_content(ctx) or ""
-            attachment_ids = ctx.reply_attachment_ids or []
+            attachment_ids = (ctx.reply_attachment_ids or [])[:10]
             if not content and not attachment_ids:
                 self.send(ctx.peer_id, "Формат: !заметка создать (название) только ответом на сообщение")
                 return
@@ -7883,7 +8846,17 @@ class FactionBot:
         try:
             self.handle_command(ctx)
         except Exception as e:
-            logger.error(f"Ошибка в потоке обработки команды '{(ctx.text or '')[:40]}': {e}", file=sys.stderr)
+            logger.error(f"Ошибка в потоке обработки команды '{(ctx.text or '')[:40]}': {e}")
+
+    def _submit_command_ctx(self, ctx: "Ctx") -> None:
+        if not self._cmd_queue_slots.acquire(blocking=False):
+            return
+        try:
+            fut = self._cmd_executor.submit(self._safe_handle_command, ctx)
+            fut.add_done_callback(lambda _f: self._cmd_queue_slots.release())
+        except Exception:
+            self._cmd_queue_slots.release()
+            raise
 
     # ── Security helpers ──────────────────────────────────────────────────────
 
@@ -7964,10 +8937,14 @@ class FactionBot:
 
     def run(self) -> None:
         logger.info("Запущен VK community bot.")
-        logger.info(f"Остановка: echo stopping > {CONTROL_PIPE_PATH}")
-        threading.Thread(target=self.control_pipe_listener, daemon=True).start()
+        if CONTROL_PIPE_ENABLED:
+            logger.info(f"Остановка: echo stopping > {CONTROL_PIPE_PATH}")
+            threading.Thread(target=self.control_pipe_listener, daemon=True).start()
+        else:
+            logger.info("Control pipe disabled. Set CONTROL_PIPE_ENABLED=1 to enable local stop pipe.")
         threading.Thread(target=self._background_cleanup, daemon=True).start()
         threading.Thread(target=self._security_audit_loop, daemon=True).start()
+        threading.Thread(target=self._subscription_poll_loop, daemon=True).start()
         if self.tg_token:
             logger.info("Telegram bridge enabled.")
             threading.Thread(target=self.telegram_listener, daemon=True).start()
@@ -8184,6 +9161,13 @@ class FactionBot:
                             fired_srv = int(payload.get("srv", 1))
                             fired_fac = str(payload.get("fac", ""))
                             if fired_uid > 0 and fired_fac:
+                                if (
+                                    not self._is_senior_admin_ctx(Ctx(user_id=user_id, peer_id=peer_id, text="", platform="vk"))
+                                    and self._get_admin_level(user_id) < 50
+                                    and not self._is_leader_for(user_id, fired_fac, fired_srv)
+                                ):
+                                    self.send(peer_id, "⛔ Недостаточно прав для удаления из чатов этой фракции.")
+                                    continue
                                 kicked = self._kick_from_faction_chats(fired_uid, fired_fac, fired_srv)
                                 self.send(peer_id, f"✅ Пользователь id{fired_uid} удалён из {kicked} чатов фракции {fired_fac}.")
                             else:
@@ -8199,6 +9183,8 @@ class FactionBot:
                             server_cb = int(payload.get("server_id", 1))
                             if not chat_id_cb or not faction_cb:
                                 self.send(peer_id, "❌ Недостаточно данных.")
+                            elif self._get_admin_level(user_id) < 70 and not self._is_leader_for(user_id, faction_cb, server_cb):
+                                self.send(peer_id, "⛔ Недостаточно прав для синхронизации ДЖ в роли.")
                             else:
                                 positions = self._dj_get_positions(faction_cb, server_cb)
                                 if not positions:
@@ -8267,20 +9253,31 @@ class FactionBot:
                     if user_id <= 0:
                         continue
                     reply = msg.get("reply_message") or {}
+                    if not reply:
+                        fwd_list = msg.get("fwd_messages") or []
+                        if fwd_list:
+                            reply = fwd_list[0]
                     own_types, own_ids = self._collect_attachment_ids(msg.get("attachments", []) or [])
                     reply_types, reply_ids = self._collect_attachment_ids(reply.get("attachments", []) or [])
                     reply_attachments = own_types + reply_types
                     reply_attachment_ids = list(dict.fromkeys(own_ids + reply_ids))
+                    reply_link_urls = list(dict.fromkeys(
+                        self._extract_link_urls(msg.get("attachments", []) or [])
+                        + self._extract_link_urls(reply.get("attachments", []) or [])
+                    ))
                     ctx = Ctx(
                         user_id=user_id,
                         peer_id=int(msg.get("peer_id", user_id)),
                         text=(msg.get("text") or "").strip(),
                         message_cmid=msg.get("conversation_message_id"),
+                        message_id=msg.get("id"),
                         reply_user_id=reply.get("from_id"),
                         reply_text=reply.get("text"),
                         reply_cmid=reply.get("conversation_message_id"),
+                        reply_message_id=reply.get("id"),
                         reply_attachments=reply_attachments,
                         reply_attachment_ids=reply_attachment_ids,
+                        reply_link_urls=reply_link_urls,
                         platform="vk",
                     )
                     self.peer_routes[ctx.peer_id] = ("vk", ctx.peer_id)
@@ -8373,27 +9370,31 @@ class FactionBot:
                                     greet_text = greet_text.replace("{user}", user_ref)
                                 else:
                                     greet_text = f"👋 {user_ref}, добро пожаловать!"
-                                kwargs_g = {"peer_id": ctx.peer_id, "random_id": 0, "message": greet_text}
-                                if str(greet["attachment"] or "").strip():
-                                    kwargs_g["attachment"] = str(greet["attachment"])
-                                if greet["sticker_id"]:
-                                    kwargs_g = {"peer_id": ctx.peer_id, "random_id": 0, "sticker_id": int(greet["sticker_id"])}
-                                try:
-                                    self.api.messages.send(**kwargs_g)
-                                except Exception as e:
-                                    logger.error(f"Ошибка отправки приветствия: {e}")
+                                self._send_greeting_payload(
+                                    ctx.peer_id, greet_text, str(greet["attachment"] or ""), greet["sticker_id"],
+                                )
 
                     if ctx.is_chat and self._enforce_chat_silence(ctx, msg.get("conversation_message_id")):
                         continue
                     if ctx.is_chat:
                         with self.db.conn() as c:
                             ra = c.execute(
-                                "SELECT source_chat_id,target_chat_id FROM remote_access_sessions WHERE actor_id=?",
+                                "SELECT source_chat_id,target_chat_id,created_at FROM remote_access_sessions WHERE actor_id=?",
                                 (ctx.user_id,),
                             ).fetchone()
                         if ra:
                             src_chat = int(ra["source_chat_id"])
                             dst_chat = int(ra["target_chat_id"])
+                            if self.now_ts() - int(ra["created_at"] or 0) > REMOTE_ACCESS_TTL_SEC:
+                                with self.db.conn() as c:
+                                    c.execute("DELETE FROM remote_access_sessions WHERE actor_id=?", (ctx.user_id,))
+                                self.send(ctx.peer_id, "⏳ Удаленный доступ истёк. Активируйте его заново.")
+                                continue
+                            if not self._has_access(ctx, "!удаленный"):
+                                with self.db.conn() as c:
+                                    c.execute("DELETE FROM remote_access_sessions WHERE actor_id=?", (ctx.user_id,))
+                                self.send(ctx.peer_id, "⛔ Удаленный доступ остановлен: права больше не подтверждаются.")
+                                continue
                             if int(ctx.chat_id) == src_chat:
                                 if ctx.text:
                                     self.send_chat(dst_chat, f"🔁 {self._fmt_user(ctx.user_id)}: {ctx.text}")
@@ -8409,8 +9410,8 @@ class FactionBot:
                                 continue
                             if int(ctx.chat_id) == dst_chat and ctx.text:
                                 self.send_chat(src_chat, f"🔁 {self._fmt_user(ctx.user_id)}: {ctx.text}")
-                    if ctx.text:
-                        self._cmd_executor.submit(self._safe_handle_command, ctx)
+                    if ctx.text and ((not ctx.is_chat) or ctx.text.lstrip().startswith("!")):
+                        self._submit_command_ctx(ctx)
             except Exception as e:
                 err = str(e)
                 if isinstance(e, requests.exceptions.ReadTimeout) or "Read timed out" in err:
@@ -8445,7 +9446,7 @@ class FactionBot:
                     username = str(from_user.get("username") or "").strip().lstrip("@").lower()
                     if user_id <= 0:
                         continue
-                    if username and username == TG_SENIOR_ADMIN_USERNAME:
+                    if TG_SENIOR_ADMIN_USERNAME and username and username == TG_SENIOR_ADMIN_USERNAME:
                         self.tg_senior_admin_runtime_id = user_id
                     chat = msg.get("chat", {})
                     chat_id = int(chat.get("id", user_id))
@@ -8484,7 +9485,7 @@ class FactionBot:
                     )
                     if ctx.is_chat and self._enforce_chat_silence(ctx, None):
                         continue
-                    if ctx.text:
+                    if ctx.text and ((not ctx.is_chat) or ctx.text.lstrip().startswith("!")):
                         self.handle_command(ctx)
             except Exception:
                 time.sleep(2)
@@ -8498,6 +9499,9 @@ def main() -> None:
         print("❌ ОШИБКА: Не найден VK_GROUP_TOKEN в файле .env")
         print("Создайте файл .env с переменной VK_GROUP_TOKEN=ваш_токен")
         sys.exit(1)
+    if not WALL_READ_TOKEN:
+        print("⚠️ ВНИМАНИЕ: VK_WALL_TOKEN/VK_USER_TOKEN/VK_SERVICE_TOKEN не задан.")
+        print("Подписки на сообщества не смогут читать новые посты через wall.get.")
     
     if not WIPE_PASSWORD or WIPE_PASSWORD == "2n3Z5opi":
         print("⚠️ ВНИМАНИЕ: Используется старый пароль WIPE_PASSWORD")
