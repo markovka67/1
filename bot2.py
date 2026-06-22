@@ -22,6 +22,7 @@ import json
 import random
 import base64
 import requests
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -143,7 +144,7 @@ PRIVACY_POLICY_URL = os.getenv("PRIVACY_POLICY_URL", "https://vk.ru/@pulse_rwpe-
 
 # ---------------------------- Быстрые настройки версии ----------------------------
 # Для тестового стенда достаточно поменять эти 2 строки:
-BOT_VERSION = "11.06.2026 5:27(МСК)"
+BOT_VERSION = "20.06.2026 16:04(МСК)"
 BOT_DB_PATH_CONFIG = os.path.join(BASE_DIR, "bot.db")
 # Backward-compat alias for legacy typo in some deployments/scripts.
 BOT_DB_PATH_CONIG = BOT_DB_PATH_CONFIG
@@ -202,13 +203,13 @@ COMMAND_ACCESS: dict[str, dict[str, int]] = {
     "!чс": {"user_default": 70, "admin_default": 10},
     "!снятьчс": {"user_default": 70, "admin_default": 10},
     "!списокчс": {"user_default": 0, "admin_default": 10},
-    "!выговор": {"user_default": 0, "admin_default": 5},
+    "!выговор": {"user_default": 0, "admin_default": 0},
     "!снять": {"user_default": 70, "admin_default": 0},
     "!чат": {"user_default": 70, "admin_default": 40},
     "!убрать": {"user_default": 70, "admin_default": 40},
     "!пуш": {"user_default": 70, "admin_default": 0},
-    "!пуш-": {"user_default": 0, "admin_default": 10},
-    "!пуш+": {"user_default": 0, "admin_default": 10},
+    "!пуш-": {"user_default": 0, "admin_default": 15},
+    "!пуш+": {"user_default": 0, "admin_default": 15},
     "!узнать": {"user_default": 0, "admin_default": 30},
     "!супербан": {"user_default": 0, "admin_default": 30},
     "!чаты": {"user_default": 0, "admin_default": 30},
@@ -328,7 +329,8 @@ COMMAND_ACCESS: dict[str, dict[str, int]] = {
     "!список доступ": {"user_default": 0, "admin_default": 30},
     "!списки": {"user_default": 0, "admin_default": 0},
     "!приглос": {"user_default": 0, "admin_default": 40},
-    "!аудит": {"user_default": 0, "admin_default": 100},
+    "!аудит файлы": {"user_default": 0, "admin_default": 100},
+    "!аватарка": {"user_default": 0, "admin_default": 0},
 }
 
 DEFAULT_COMMAND_RIGHTS = {k: v["user_default"] for k, v in COMMAND_ACCESS.items()}
@@ -573,6 +575,7 @@ COMMAND_USAGE: dict[str, str] = {
 
     "!приглос": "!приглос [уровень роли] — настроить минимальную роль для приглашения в чат",
     "!аудит": "!аудит файлы — проверить хеши bot1.py, .env, bot.db",
+    "!аватарка": "!аватарка [@username|ссылка|id] — показать аватарку пользователя; можно ответом на сообщение",
 }
 
 COMMAND_REQUIRED_ARGS: dict[str, list[str]] = {
@@ -752,13 +755,14 @@ class DB:
                     min_admin INTEGER NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS notes (
-                    chat_id INTEGER NOT NULL,
-                    name TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    attachments TEXT,
-                    min_role INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY(chat_id, name)
+                CREATE TABLE IF NOT EXISTS chat_greetings (
+                    chat_id INTEGER PRIMARY KEY,
+                    text TEXT NOT NULL DEFAULT '',
+                    attachment TEXT NOT NULL DEFAULT '',
+                    sticker_id INTEGER,
+                    source_message_id INTEGER,
+                    created_by INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS message_bookmarks (
@@ -1119,6 +1123,14 @@ class DB:
             c.execute("UPDATE faction_strikes SET server_id=1 WHERE server_id IS NULL OR server_id<1 OR server_id>3")
             try:
                 c.execute("ALTER TABLE notes ADD COLUMN attachments TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE notes ADD COLUMN source_message_id INTEGER")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE chat_greetings ADD COLUMN source_message_id INTEGER")
             except sqlite3.OperationalError:
                 pass
             try:
@@ -2200,6 +2212,136 @@ class FactionBot:
                 return int(row["vk_id"])
         return None
 
+
+    def _safe_download_avatar(self, url: str, max_bytes: int = 8 * 1024 * 1024) -> tuple[Optional[bytes], str]:
+        """Скачивает только HTTPS-аватарку, полученную от VK API, с лимитом размера."""
+        parsed = urlparse(str(url or "").strip())
+        if parsed.scheme != "https" or not parsed.netloc:
+            return None, "VK вернул некорректную ссылку на аватарку."
+
+        try:
+            with self.http.get(url, stream=True, timeout=(5, 15), allow_redirects=False) as resp:
+                if resp.status_code != 200:
+                    return None, "Не удалось скачать аватарку пользователя."
+                content_type = str(resp.headers.get("Content-Type") or "").lower()
+                if not content_type.startswith("image/"):
+                    return None, "VK вернул не изображение вместо аватарки."
+                content_length = resp.headers.get("Content-Length")
+                if content_length and int(content_length) > max_bytes:
+                    return None, "Аватарка слишком большая для безопасной отправки."
+
+                data = bytearray()
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    data.extend(chunk)
+                    if len(data) > max_bytes:
+                        return None, "Аватарка слишком большая для безопасной отправки."
+                if not data:
+                    return None, "VK вернул пустое изображение аватарки."
+                return bytes(data), ""
+        except Exception as e:
+            logger.error(f"avatar download failed for host={parsed.netloc}: {e}")
+            return None, "Не удалось безопасно скачать аватарку."
+
+    def _upload_message_photo_bytes(self, image: bytes, peer_id: int) -> Optional[str]:
+        """Загружает байты изображения в сообщения VK и возвращает attachment photo..."""
+        try:
+            server = self.api.photos.getMessagesUploadServer(peer_id=int(peer_id))
+            upload_url = str(server.get("upload_url") or "")
+            parsed = urlparse(upload_url)
+            if parsed.scheme != "https" or not parsed.netloc:
+                logger.error("VK returned unsafe messages upload URL")
+                return None
+
+            files = {"photo": ("avatar.jpg", image, "image/jpeg")}
+            upload = self.http.post(upload_url, files=files, timeout=(5, 20)).json()
+            saved = self.api.photos.saveMessagesPhoto(
+                photo=upload.get("photo"),
+                server=upload.get("server"),
+                hash=upload.get("hash"),
+            )
+            if not saved:
+                return None
+            photo = saved[0]
+            owner_id = int(photo.get("owner_id"))
+            photo_id = int(photo.get("id"))
+            access_key = str(photo.get("access_key") or "")
+            attachment = f"photo{owner_id}_{photo_id}"
+            if access_key:
+                attachment += f"_{access_key}"
+            return attachment
+        except Exception as e:
+            logger.error(f"avatar upload failed: {e}")
+            return None
+
+    def cmd_avatar(self, ctx: Ctx, parts: list[str]) -> None:
+        target = (self._parse_user(parts[1]) if len(parts) > 1 else None) or ctx.reply_user_id
+        if target is None:
+            self.send(ctx.peer_id, "🖼 Формат: !аватарка (@username|ссылка|id) или ответом на сообщение пользователя.")
+            return
+        if int(target) <= 0:
+            self.send(ctx.peer_id, "❌ Можно показать аватарку только пользователя VK.")
+            return
+
+        try:
+            users = self.api.users.get(
+                user_ids=str(int(target)),
+                fields="photo_id,photo_max,photo_max_orig,photo_400_orig,photo_200_orig,photo_100,photo_50",
+            )
+        except Exception as e:
+            logger.error(f"users.get for avatar failed target={target}: {e}")
+            self.send(ctx.peer_id, "❌ Не удалось получить профиль пользователя VK.")
+            return
+
+        if not users:
+            self.send(ctx.peer_id, "❌ Пользователь не найден.")
+            return
+
+        user = users[0]
+
+        photo_url = (
+            user.get("photo_max_orig")
+            or user.get("photo_max")
+            or user.get("photo_400_orig")
+            or user.get("photo_200_orig")
+            or user.get("photo_100")
+            or user.get("photo_50")
+            or ""
+        )
+        photo_url = str(photo_url).strip()
+
+        logger.info(
+            f"[avatar] target={target} fields={ {k: user.get(k) for k in ['photo_id','photo_max_orig','photo_max','photo_400_orig','photo_200_orig','photo_100','photo_50']} }"
+        )
+
+        if not photo_url:
+            self.send(ctx.peer_id, f"🖼 У пользователя {self._fmt_user(int(target))} VK не вернул ссылку на аватарку.")
+            return
+
+        if "camera_" in photo_url or "deactivated_" in photo_url:
+            self.send(ctx.peer_id, f"🖼 У пользователя {self._fmt_user(int(target))} стоит стандартная аватарка VK.")
+            return
+
+        image, err = self._safe_download_avatar(photo_url)
+        if image is None:
+            self.send(ctx.peer_id, f"❌ {err}")
+            return
+
+        attachment = self._upload_message_photo_bytes(image, ctx.peer_id)
+        if not attachment:
+            self.send(ctx.peer_id, "❌ Не удалось загрузить аватарку в сообщение VK.")
+            return
+
+        self.send_with_attachments(
+            ctx.peer_id,
+            f"🖼 Аватарка пользователя {self._fmt_user(int(target))}:",
+            [attachment],
+        )
+
+
+
+
     def _fmt_user_ref(self, user_id: int, name: Optional[str] = None) -> str:
         if user_id <= 0:
             return "неизвестно"
@@ -3014,7 +3156,7 @@ class FactionBot:
         wanted = self._normalize_note_key(raw_name)
         if not wanted:
             return None
-        columns = "name,min_role,attachments,content" if with_content else "name,min_role,attachments"
+        columns = "name,min_role,attachments,content,source_message_id" if with_content else "name,min_role,attachments,source_message_id"
         with self.db.conn() as c:
             rows = c.execute(f"SELECT {columns} FROM notes WHERE chat_id=?", (chat_id,)).fetchall()
         for row in rows:
@@ -4685,6 +4827,11 @@ class FactionBot:
             )
             return
 
+        if cmd == "!аватарка":
+            self.cmd_avatar(ctx, parts)
+            return
+
+
         if cmd == "!банан":
             # Получаем целевого пользователя (из ответа или из аргумента)
             target = (self._parse_user(parts[1]) if len(parts) > 1 else None) or ctx.reply_user_id
@@ -4829,7 +4976,8 @@ class FactionBot:
                         tag = f"[роль {need_role}+]"
 
                 if accessible:
-                    line = f"• {ccmd}"
+                    usage = COMMAND_USAGE.get(ccmd, ccmd)
+                    line = f"• {usage}"
                     if tag:
                         line += f"  {tag}"
                     available.append(line)
@@ -5143,10 +5291,22 @@ class FactionBot:
                 self.send(ctx.peer_id, "❌ Команда доступна только в чате.")
                 return
             with self.db.conn() as c:
-                row = c.execute("SELECT text, attachment, sticker_id FROM chat_greetings WHERE chat_id=?", (ctx.chat_id,)).fetchone()
-            if not row or (not str(row["text"]).strip() and not str(row["attachment"] or "").strip() and not row["sticker_id"]):
+                row = c.execute("SELECT text, attachment, sticker_id, source_message_id FROM chat_greetings WHERE chat_id=?", (ctx.chat_id,)).fetchone()
+            if not row or (not str(row["text"]).strip() and not str(row["attachment"] or "").strip() and not row["sticker_id"] and not row["source_message_id"]):
                 self.send(ctx.peer_id, "ℹ️ Приветствие для этого чата не установлено.\nЧтобы установить, ответьте на сообщение: !новое приветствие")
                 return
+            source_message_id = int(row["source_message_id"] or 0)
+            if source_message_id:
+                try:
+                    self.api.messages.send(
+                        peer_id=ctx.peer_id,
+                        random_id=random.randint(1, 2_147_483_647),
+                        forward_messages=str(source_message_id),
+                        disable_mentions=1,
+                    )
+                    return
+                except Exception as e:
+                    logger.error(f"Не удалось отправить приветствие forward_messages={source_message_id}: {e}")
             # Воспроизводим приветствие
             def _notify_failed(failed_list, _peer=ctx.peer_id):
                 self.send(_peer, f"⚠️ {len(failed_list)} вложение(й) приветствия недоступны и не были отправлены.")
@@ -5167,7 +5327,7 @@ class FactionBot:
             if self._get_admin_level(ctx.user_id) < 40 and not self._is_senior_admin_ctx(ctx) and not self._is_leader_user(ctx.user_id):
                 self.send(ctx.peer_id, "⛔ Для установки приветствия нужен admin 40+ или лидер фракции.")
                 return
-            if not ctx.reply_text and not ctx.reply_user_id and not ctx.reply_attachment_ids:
+            if not ctx.reply_message_id and not ctx.reply_text and not ctx.reply_user_id and not ctx.reply_attachment_ids:
                 self.send(ctx.peer_id, "❌ Используйте команду ОТВЕТОМ на сообщение, которое станет приветствием.")
                 return
             # Извлекаем текст и вложения из reply
@@ -5211,8 +5371,8 @@ class FactionBot:
             now = self.now_ts()
             with self.db.conn() as c:
                 c.execute(
-                    "INSERT OR REPLACE INTO chat_greetings(chat_id, text, attachment, created_by, updated_at) VALUES(?,?,?,?,?)",
-                    (ctx.chat_id, greet_text.strip(), stored_attachment, ctx.user_id, now),
+                    "INSERT OR REPLACE INTO chat_greetings(chat_id, text, attachment, source_message_id, created_by, updated_at) VALUES(?,?,?,?,?,?)",
+                    (ctx.chat_id, greet_text.strip(), stored_attachment, int(ctx.reply_message_id or 0) or None, ctx.user_id, now),
                 )
             warn = ""
             if broken_ids:
@@ -6232,22 +6392,35 @@ class FactionBot:
             self.send(ctx.peer_id, "ℹ️ Команда !история удалена.")
             return
 
-        if cmd == "!новый" and len(parts) >= 5 and parts[1].lower() == "префикс":
+        if cmd == "!новый" and len(parts) >= 4 and parts[1].lower() == "префикс":
             if self._get_admin_level(ctx.user_id) < 90:
                 self.send(ctx.peer_id, "⛔ Доступно только админам 90+.")
                 return
+
             target = self._parse_user(parts[2]) or ctx.reply_user_id
             if target is None:
-                self.send(ctx.peer_id, "Формат: !новый префикс (пользователь) (название) (смайлик)")
+                self.send(ctx.peer_id, "Формат: !новый префикс (пользователь) (название до 10 слов)")
                 return
-            name = parts[3]
-            emoji = parts[4]
+
+            prefix_words = parts[3:]
+            if not prefix_words:
+                self.send(ctx.peer_id, "Формат: !новый префикс (пользователь) (название до 10 слов)")
+                return
+
+            if len(prefix_words) > 10:
+                self.send(ctx.peer_id, "❌ Префикс слишком длинный. Максимум 10 слов.")
+                return
+
+            name = " ".join(prefix_words).strip()
+            emoji = ""
+
             with self.db.conn() as c:
                 c.execute(
                     "INSERT OR REPLACE INTO user_prefixes(vk_id,name,emoji) VALUES(?,?,?)",
                     (target, name, emoji),
                 )
-            self.send(ctx.peer_id, f"✅ Префикс «{name} {emoji}» добавлен пользователю {self._fmt_user(target)}.")
+
+            self.send(ctx.peer_id, f"✅ Префикс «{name}» добавлен пользователю {self._fmt_user(target)}.")
             return
 
         if cmd == "!снять" and len(parts) >= 2 and parts[1].lower() == "выговор":
@@ -6492,7 +6665,8 @@ class FactionBot:
                     if target_role >= need_role:
                         available.append(f"• {ccmd}  [роль {need_role}+]")
                 else:
-                    available.append(f"• {ccmd}")
+                    usage = COMMAND_USAGE.get(ccmd, ccmd)
+                    available.append(f"• {usage}")
             header = f"🔍 Команды для {self._fmt_user(target)} (адм.{target_admin}, роль {target_role}):"
             self.send(ctx.peer_id, header + "\n" + "\n".join(available) if available else header + "\nнет доступных команд")
             return
@@ -7004,8 +7178,9 @@ class FactionBot:
             return
 
         if cmd == "!выговор":
-            if self._get_admin_level(ctx.user_id) < 5:
-                self.send(ctx.peer_id, "⛔ Команда доступна с 5 уровня админ-прав.")
+            required_admin = self._get_effective_admin_min("!выговор")
+            if self._get_admin_level(ctx.user_id) < required_admin:
+                self.send(ctx.peer_id, f"⛔ Команда доступна с {required_admin} уровня админ-прав.")
                 return
             actor = self._user(ctx.user_id)
             actor_faction = actor["faction"] if actor else None
@@ -8673,34 +8848,7 @@ class FactionBot:
         if parts[0].lower() == "!заметки" and len(parts) > 1:
             parts = ["!заметка"] + parts[1:]
 
-        # !новая заметка (название) / ответом на сообщение
-        if parts[0].lower() == "!новая" and len(parts) >= 3 and parts[1].lower() == "заметка":
-            raw_rest = re.sub(r"^!\s*новая\s+заметка\s+", "", ctx.text, flags=re.I | re.S).strip()
-            name = raw_rest.split(maxsplit=1)[0].strip() if raw_rest else None
-            if not name:
-                self.send(ctx.peer_id, "❌ Не удалось распознать название заметки.")
-                return
-            if " " in name:
-                self.send(ctx.peer_id, "❌ Название заметки должно быть одним словом.")
-                return
-            content = self._compose_reply_note_content(ctx) or ""
-            attachment_ids = (ctx.reply_attachment_ids or [])[:10]
-            if not content and not attachment_ids:
-                self.send(ctx.peer_id, "Формат: !новая заметка (название) только ответом на сообщение с текстом/вложениями")
-                return
-            with self.db.conn() as c:
-                old = self._find_note_by_name(ctx.chat_id, name)
-                stored_name = old["name"] if old else name
-                min_role = int(old["min_role"]) if old else 0
-                existing_attachments = (old["attachments"] if old else None) or ""
-                stored_attachments = ",".join(attachment_ids) if attachment_ids else existing_attachments
-                c.execute(
-                    "INSERT OR REPLACE INTO notes(chat_id,name,content,attachments,min_role) VALUES(?,?,?,?,?)",
-                    (ctx.chat_id, stored_name, content, stored_attachments, min_role),
-                )
-            self.send(ctx.peer_id, f"✅ Заметка «{name}» создана.")
-            return
-
+ 
         # !заметка создать (название) / ответом на сообщение
         if len(parts) >= 3 and parts[1].lower() == "создать":
             raw_rest = re.sub(r"^!\s*замет(?:ка|ки)\s+создать\s+", "", ctx.text, flags=re.I | re.S).strip()
@@ -8713,9 +8861,12 @@ class FactionBot:
                 return
             content = self._compose_reply_note_content(ctx) or ""
             attachment_ids = (ctx.reply_attachment_ids or [])[:10]
-            if not content and not attachment_ids:
-                self.send(ctx.peer_id, "Формат: !заметка создать (название) только ответом на сообщение")
+            source_message_id = int(ctx.reply_message_id or 0)
+
+            if not source_message_id and not content and not attachment_ids:
+                self.send(ctx.peer_id, "Формат: !новая заметка (название) только ответом на сообщение с текстом/вложениями")
                 return
+
             with self.db.conn() as c:
                 old = self._find_note_by_name(ctx.chat_id, name)
                 stored_name = old["name"] if old else name
@@ -8723,9 +8874,10 @@ class FactionBot:
                 existing_attachments = (old["attachments"] if old else None) or ""
                 stored_attachments = ",".join(attachment_ids) if attachment_ids else existing_attachments
                 c.execute(
-                    "INSERT OR REPLACE INTO notes(chat_id,name,content,attachments,min_role) VALUES(?,?,?,?,?)",
-                    (ctx.chat_id, stored_name, content, stored_attachments, min_role),
+                    "INSERT OR REPLACE INTO notes(chat_id,name,content,attachments,source_message_id,min_role) VALUES(?,?,?,?,?,?)",
+                    (ctx.chat_id, stored_name, content, stored_attachments, source_message_id or None, min_role),
                 )
+
             self.send(ctx.peer_id, f"✅ Заметка «{name}» создана.")
             return
 
@@ -8774,6 +8926,22 @@ class FactionBot:
             if role < int(row["min_role"]):
                 self.send(ctx.peer_id, "⛔ Недостаточно прав для просмотра заметки.")
                 return
+            source_message_id = int(row["source_message_id"] or 0)
+
+            if source_message_id:
+                try:
+                    self.api.messages.send(
+                        peer_id=ctx.peer_id,
+                        random_id=random.randint(1, 2_147_483_647),
+                        message=f"📌 {row['name']}",
+                        forward_messages=str(source_message_id),
+                        disable_mentions=1,
+                    )
+                    return
+                except Exception as e:
+                    logger.error(f"Не удалось отправить заметку forward_messages={source_message_id}: {e}")
+
+
             attachments = [a for a in (row["attachments"] or "").split(",") if a]
             body = row["content"] or "(без текста)"
             self.send_with_attachments(ctx.peer_id, f"📌 {row['name']}\n{body}", attachments)
@@ -9359,10 +9527,10 @@ class FactionBot:
                         if action_type in {"chat_invite_user", "chat_invite_user_by_link"} and invited_id > 0:
                             with self.db.conn() as c:
                                 greet = c.execute(
-                                    "SELECT text, attachment, sticker_id FROM chat_greetings WHERE chat_id=?",
+                                    "SELECT text, attachment, sticker_id, source_message_id FROM chat_greetings WHERE chat_id=?",
                                     (ctx.chat_id,),
                                 ).fetchone()
-                            if greet and (str(greet["text"]).strip() or str(greet["attachment"] or "").strip() or greet["sticker_id"]):
+                            if greet and (str(greet["text"]).strip() or str(greet["attachment"] or "").strip() or greet["sticker_id"] or greet["source_message_id"]):
                                 greet_text = str(greet["text"] or "").strip()
                                 user_ref = self._fmt_user(invited_id)
                                 # Подставляем упоминание если есть {user} в тексте
@@ -9370,6 +9538,19 @@ class FactionBot:
                                     greet_text = greet_text.replace("{user}", user_ref)
                                 else:
                                     greet_text = f"👋 {user_ref}, добро пожаловать!"
+                                source_message_id = int(greet["source_message_id"] or 0)
+                                if source_message_id:
+                                    try:
+                                        self.api.messages.send(
+                                            peer_id=ctx.peer_id,
+                                            random_id=random.randint(1, 2_147_483_647),
+                                            message=greet_text if greet_text else "",
+                                            forward_messages=str(source_message_id),
+                                            disable_mentions=1,
+                                        )
+                                        continue
+                                    except Exception as e:
+                                        logger.error(f"Не удалось отправить автоприветствие forward_messages={source_message_id}: {e}")
                                 self._send_greeting_payload(
                                     ctx.peer_id, greet_text, str(greet["attachment"] or ""), greet["sticker_id"],
                                 )
